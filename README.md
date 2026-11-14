@@ -30,6 +30,8 @@ Buka **UDP 500/4500** pada firewall platform. API tetap di **`127.0.0.1:8000`**,
 - [Pool VIP acak per server dan migrasi](dokumentasi/pool-vip.md)
 - [Tuning kernel, jaringan, MTU/MSS dan rollback](dokumentasi/tuning-kernel-network.md)
 
+Setiap akun punya batas sesi bersamaan `max_sessions` 1–3 (default 3). Backend menegakkannya setiap 5 detik: sesi IKE terbaru di atas batas dihentikan berdasarkan ID numerik, sesi tertua tetap hidup, tercatat di journald dan audit. Lihat [REST API: batas sesi](dokumentasi/rest-api.md#batas-sesi-bersamaan-max_sessions).
+
 Pool /24 dipilih sekali dari `172.31.201..250.0/24` lalu disimpan di environment; reinstall mempertahankan pool, lease, DB, PKI dan API key. Tuning tidak memasang OpenVPN/WireGuard; preset kedua engine masih nonaktif.
 
 Source di `src/`. Bangun ulang script setelah perubahan: `python3 build-installer.py`. Pengujian: buat venv, pasang `src/requirements.txt pytest httpx`, lalu `PYTHONPATH=src python -m pytest tests -q`.

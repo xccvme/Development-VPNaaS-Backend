@@ -28,15 +28,24 @@ def run(args,timeout=20,input=None):
     if result.returncode:raise RuntimeError('VPN command failed')
     return result.stdout
 
-def vip(user):
+def _lease(value):
     from pool import network
     import ipaddress
-    value=user.get('virtual_ip')
     if not value:raise HTTPException(409,'User VIP missing; migrate database first')
     addr=ipaddress.IPv4Address(value)
     if addr not in network() or addr in (network().network_address,network().broadcast_address):
         raise HTTPException(409,'Invalid persisted user VIP')
     return str(addr)
+
+def vip(user):
+    return _lease(user.get('virtual_ip'))
+
+def session_vips(user):
+    """Primary VIP first, then one extra VIP per additional concurrent session slot."""
+    return [vip(user)]+[_lease(v) for v in user.get('extra_virtual_ips',[])]
+
+def pool_names(user):
+    return [f"pool-{user['id']}"]+[f"pool-{user['id']}-{n}" for n in range(2,len(session_vips(user))+1)]
 
 def render(connections,users):
     lines=['connections {']
@@ -74,7 +83,7 @@ def render(connections,users):
  proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
  fragmentation = yes
  send_cert = always
- unique = replace
+ unique = never
  local {{ auth = pubkey
  certs = server.pem
  id = {PUBLIC_IP}
@@ -94,10 +103,11 @@ def render(connections,users):
  local_addrs = {PUBLIC_IP}
  remote_addrs = %any
  proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
- pools = pool-{i}
+ pools = {','.join(pool_names(u))}
  fragmentation = yes
  send_cert = always
- unique = replace
+ unique = never
+ dpd_delay = 30s
  local {{ auth = pubkey
  certs = server.pem
  id = {PUBLIC_IP}
@@ -117,7 +127,8 @@ def render(connections,users):
     for u in users:
         if not u['enabled']:continue
         dns=f"\n dns = {','.join(full_dns())}" if is_full(u) else ''
-        lines.append(f"pool-{u['id']} {{ addrs = {vip(u)}{dns}\n }}")
+        for name,address in zip(pool_names(u),session_vips(u)):
+            lines.append(f"{name} {{ addrs = {address}{dns}\n }}")
     lines.append('}\nsecrets {')
     for c in connections:
         if c['enabled']:lines.append(f'ike-{c["id"]} {{ id-1 = {PUBLIC_IP}\n id-2 = {c["remote_id"]}\n secret = "{c["psk"]}"\n }}')
@@ -131,20 +142,21 @@ def firewall(connections,users,policies):
     pool=str(network())
     lines=['table inet vpnaas {','chain users {']
     for u in users:
-        if u['enabled']:
-            if is_full(u):lines.append(f'ip saddr {vip(u)} ip daddr {pool} drop')
-            for dest in u['allowed_cidrs']:lines.append(f'ip saddr {vip(u)} ip daddr {dest} accept')
+        if not u['enabled']:continue
+        for v in session_vips(u):
+            if is_full(u):lines.append(f'ip saddr {v} ip daddr {pool} drop')
+            for dest in u['allowed_cidrs']:lines.append(f'ip saddr {v} ip daddr {dest} accept')
             if is_full(u):
-                lines.append(f'ip saddr {vip(u)} ip daddr {NON_PUBLIC} drop')
-                lines.append(f'ip saddr {vip(u)} oifname "{PUBLIC_IF}" accept')
-    full=[vip(u) for u in users if u['enabled'] and is_full(u)]
+                lines.append(f'ip saddr {v} ip daddr {NON_PUBLIC} drop')
+                lines.append(f'ip saddr {v} oifname "{PUBLIC_IF}" accept')
+    full=[v for u in users if u['enabled'] and is_full(u) for v in session_vips(u)]
     lines+=['drop']
     lines+=['}', 'chain mss { type filter hook forward priority mangle; policy accept;']
     for u in users:
         if not u['enabled']:continue
-        v=vip(u)
-        lines.append(f'ip saddr {v} meta ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
-        lines.append(f'ip daddr {v} rt ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+        for v in session_vips(u):
+          lines.append(f'ip saddr {v} meta ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+          lines.append(f'ip daddr {v} rt ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
     for c in connections:
         if not c['enabled']:continue
         for source,dest,match in ((c['remote_ts'],c['local_ts'],'meta'),(c['local_ts'],c['remote_ts'],'rt')):

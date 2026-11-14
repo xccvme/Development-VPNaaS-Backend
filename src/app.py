@@ -1,7 +1,18 @@
 import os
 import secrets
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Depends
-app=FastAPI(title='VPNaaS PoC')
+
+@asynccontextmanager
+async def lifespan(_app):
+    import sessions
+    sessions.start()
+    try:
+        yield
+    finally:
+        await sessions.stop()
+
+app=FastAPI(title='VPNaaS PoC',lifespan=lifespan)
 def authorize(x_api_key: str=Header(default='')):
     if not secrets.compare_digest(x_api_key, os.environ.get('VPNAAS_API_KEY','')) or not x_api_key:
         raise HTTPException(401,'Unauthorized')
@@ -59,6 +70,12 @@ def register(kind):
                 db.rollback();raise
     deps=[Depends(authorize)]
     app.add_api_route('/api/'+kind,listing,methods=['GET'],dependencies=deps)
+    if kind=='users':
+        def detail(ident:int):
+            with lock:user=public(get(kind,ident))
+            from runtime import user_runtime
+            return dict(user,**user_runtime([user])[user['id']])
+        app.add_api_route('/api/'+kind+'/{ident}',detail,methods=['GET'],dependencies=deps)
     app.add_api_route('/api/'+kind,create,methods=['POST'],dependencies=deps)
     app.add_api_route('/api/'+kind+'/{ident}',update,methods=['PUT'],dependencies=deps)
     app.add_api_route('/api/'+kind+'/{ident}',delete,methods=['DELETE'],dependencies=deps)

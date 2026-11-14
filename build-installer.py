@@ -8,7 +8,7 @@ from pathlib import Path
 import tarfile
 
 root = Path(__file__).resolve().parent
-files = ('app.py', 'pool.py', 'tuning.py', 'network.py', 'requirements.txt', 'runtime.py', 'store.py', 'vpn.py')
+files = ('app.py', 'pool.py', 'tuning.py', 'network.py', 'requirements.txt', 'runtime.py', 'sessions.py', 'store.py', 'vpn.py')
 archive = io.BytesIO()
 with tarfile.open(fileobj=archive, mode='w', format=tarfile.USTAR_FORMAT) as tar:
     for name in files:

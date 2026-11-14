@@ -49,12 +49,31 @@ def ensure(path,occupied):
         return value
 
 
-def allocate(users):
+def leased(users):
+    """Every persisted VIP: primary plus per-session extras."""
+    return {v for u in users for v in [u.get('virtual_ip'),*u.get('extra_virtual_ips',[])] if v}
+
+
+def allocate_many(users,count):
     from fastapi import HTTPException
-    used={u.get('virtual_ip') for u in users}
+    used=leased(users);result=[]
     for host in network().hosts():
-        if str(host) not in used:return str(host)
-    raise HTTPException(409,'VIP pool exhausted (254 usable hosts)')
+        if len(result)==count:break
+        if str(host) not in used:result.append(str(host))
+    if len(result)<count:raise HTTPException(409,'VIP pool exhausted (254 usable hosts; each session slot needs one)')
+    return result
+
+
+def allocate(users):
+    return allocate_many(users,1)[0]
+
+
+def size_extras(data,others):
+    """Keep existing extra session VIPs (stable), trim or add up to max_sessions-1."""
+    extras=list(data.get('extra_virtual_ips',[]))[:max(0,data['max_sessions']-1)]
+    need=data['max_sessions']-1-len(extras)
+    if need>0:extras+=allocate_many([*others,{'virtual_ip':data['virtual_ip'],'extra_virtual_ips':extras}],need)
+    return extras
 
 
 def migrate(conn):
@@ -67,9 +86,31 @@ def migrate(conn):
             if addr not in network() or addr in (network().network_address,network().broadcast_address) or value in used:
                 raise ValueError('Invalid or duplicate VIP; explicit backed-up migration required')
             used.add(value)
+        for value in u.get('extra_virtual_ips',[]):
+            addr=ipaddress.IPv4Address(value)
+            if addr not in network() or addr in (network().network_address,network().broadcast_address) or value in used:
+                raise ValueError('Invalid or duplicate session VIP; explicit backed-up migration required')
+            used.add(value)
     for i,u in users:
         if not u.get('virtual_ip'):
             u['virtual_ip']=allocate([{'virtual_ip':v} for v in used]);used.add(u['virtual_ip'])
+            conn.execute('UPDATE objects SET body=? WHERE id=?',(json.dumps(u),i))
+    # One VIP per concurrent session slot. Never churn existing leases; if the
+    # pool cannot supply a slot, clamp max_sessions instead of failing start-up.
+    for i,u in users:
+        limit=u.get('max_sessions',3)
+        extras=list(u.get('extra_virtual_ips',[]))
+        for value in extras[max(0,limit-1):]:used.discard(value)
+        extras=extras[:max(0,limit-1)]
+        while len(extras)<limit-1:
+            free=next((str(h) for h in network().hosts() if str(h) not in used),None)
+            if free is None:
+                limit=1+len(extras)
+                print(f'VIP pool full: user {i} max_sessions clamped to {limit}')
+                break
+            extras.append(free);used.add(free)
+        if extras!=u.get('extra_virtual_ips') or limit!=u.get('max_sessions'):
+            u['extra_virtual_ips']=extras;u['max_sessions']=limit
             conn.execute('UPDATE objects SET body=? WHERE id=?',(json.dumps(u),i))
     conn.commit()
 

@@ -36,7 +36,7 @@ def diagnostics(users):
     return {'public_interface':public,'private_routes':result,'private_ready':all(x['ready'] for x in result),'mode':'kernel-route-auto'}
 
 def route_firewall(text,users):
-    from vpn import vip, PUBLIC_IF, PUBLIC_IP
+    from vpn import session_vips, PUBLIC_IF, PUBLIC_IP
     from pool import network
     pool=str(network())
     routes=snapshot(); public=public_interface(routes)
@@ -48,12 +48,13 @@ def route_firewall(text,users):
             line=line.split(' snat to ')[0]+' masquerade'
         for u in users:
             if not u['enabled']:continue
-            for cidr in u['allowed_cidrs']:
-                grant=f'ip saddr {vip(u)} ip daddr {cidr} accept'
-                if line==grant:
-                    dev=private_route(cidr,routes,public)
-                    line=f'ip saddr {vip(u)} ip daddr {cidr} '+(f'oifname "{dev}" accept' if dev else 'drop')
-                    if dev:nat.append(f'ip saddr {vip(u)} ip daddr {cidr} oifname "{dev}" masquerade')
+            for v in session_vips(u):
+                for cidr in u['allowed_cidrs']:
+                    grant=f'ip saddr {v} ip daddr {cidr} accept'
+                    if line==grant:
+                        dev=private_route(cidr,routes,public)
+                        line=f'ip saddr {v} ip daddr {cidr} '+(f'oifname "{dev}" accept' if dev else 'drop')
+                        if dev:nat.append(f'ip saddr {v} ip daddr {cidr} oifname "{dev}" masquerade')
         out.append(line)
         if line.startswith('chain nat {'):out.extend(nat)
     # Recheck every outbound VPN packet before established-flow acceptance:

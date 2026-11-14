@@ -67,7 +67,7 @@ Pembacaan remote memerlukan izin sudo yang sesuai (atau sesi root yang diizinkan
 
 ## 2. Konvensi dan seluruh route
 
-Semua **19 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka huruf besar/kecil. Request POST/PUT CRUD memakai `Content-Type: application/json` dengan objek JSON, bukan array. Respons sukses bisnis selalu HTTP **200**, termasuk create dan delete (bukan 201/204).
+Semua **20 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka huruf besar/kecil. Request POST/PUT CRUD memakai `Content-Type: application/json` dengan objek JSON, bukan array. Respons sukses bisnis selalu HTTP **200**, termasuk create dan delete (bukan 201/204).
 
 | Metode | Path | Fungsi |
 |---|---|---|
@@ -76,6 +76,7 @@ Semua **19 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka h
 | GET | `/api/status` | Status daemon, pool, dan diagnostik route |
 | GET | `/api/audit` | Maksimal 500 metadata perubahan terakhir |
 | GET | `/api/users` | Seluruh akun dan runtime |
+| GET | `/api/users/{ident}` | Satu akun dan runtime |
 | POST | `/api/users` | Buat akun |
 | PUT | `/api/users/{ident}` | Ubah sebagian field akun |
 | DELETE | `/api/users/{ident}` | Hapus akun |
@@ -91,9 +92,9 @@ Semua **19 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka h
 | PUT | `/api/policies/{ident}` | Ubah sebagian field policy |
 | DELETE | `/api/policies/{ident}` | Hapus policy |
 
-`ident` adalah ID integer dari respons create/list. ID objek dipakai bersama lintas jenis resource, tidak dijamin berurutan dan **bukan** nomor host VIP. Tidak ada GET detail `/api/users/{ident}`, `/api/connections/{ident}`, atau `/api/policies/{ident}`; ambil list dan pilih berdasarkan `id`. Tidak ada PATCH, bulk CRUD, pencarian, pagination, total header, atau query filter. List berupa array langsung `[]`, diurutkan `id` naik, tanpa envelope `items/data`. Audit berbeda: urutan `id` turun, dibatasi 500, tanpa cursor/offset. Jangan mengandalkan query parameter yang tidak didukung untuk membatasi hasil.
+`ident` adalah ID integer dari respons create/list. ID objek dipakai bersama lintas jenis resource, tidak dijamin berurutan dan **bukan** nomor host VIP. GET detail hanya tersedia untuk `/api/users/{ident}` (404 bila tidak ada); tidak ada GET detail `/api/connections/{ident}` atau `/api/policies/{ident}`, ambil list dan pilih berdasarkan `id`. Tidak ada PATCH, bulk CRUD, pencarian, pagination, total header, atau query filter. List berupa array langsung `[]`, diurutkan `id` naik, tanpa envelope `items/data`. Audit berbeda: urutan `id` turun, dibatasi 500, tanpa cursor/offset. Jangan mengandalkan query parameter yang tidak didukung untuk membatasi hasil.
 
-PUT bersifat **merge parsial**, bukan penggantian penuh: field yang tidak dikirim dipertahankan. Body `{}` juga diterima untuk objek yang ada dan tetap menjalankan apply/revocation. Field tak dikenal ditolak, termasuk `id`, `virtual_ip`, runtime, atau `dns` dalam request CRUD. `enabled` harus boolean JSON `true/false`, bukan string/angka.
+PUT bersifat **merge parsial**, bukan penggantian penuh: field yang tidak dikirim dipertahankan. Body `{}` juga diterima untuk objek yang ada dan tetap menjalankan apply/revocation. Field tak dikenal ditolak, termasuk `id`, `virtual_ip`, `extra_virtual_ips`, runtime, atau `dns` dalam request CRUD. `enabled` harus boolean JSON `true/false`, bukan string/angka.
 
 ### OpenAPI dan halaman dokumentasi bawaan
 
@@ -117,8 +118,9 @@ curl --fail --silent --show-error "$API_BASE/docs/oauth2-redirect" --output oaut
 | `username` | string 1–128 karakter, regex `[A-Za-z0-9_@.:-]{1,128}`; unik pada users | Wajib POST; tidak dikirim pada PUT → tetap |
 | `password` | string 8–128 karakter, regex `[A-Za-z0-9_@.!+,:/=-]{8,128}` | Wajib POST; omit atau string kosong pada PUT → password lama |
 | `enabled` | boolean | `true`; `false` menonaktifkan akses administratif |
-| `allowed_cidrs` | array 1–16 CIDR IPv4, tidak boleh `/0` | Default `[VPNAAS_LAN_CIDR]`; sebaiknya selalu kirim izin eksplisit |
+| `allowed_cidrs` | array 1–16 CIDR IPv4, tidak boleh `/0` | Bila dihilangkan: `[VPNAAS_LAN_CIDR]`; bila instalasi belum punya LAN (placeholder `192.0.2.0/24`), memakai subnet LAN privat yang saat ini menempel di NIC non-publik (NIC yang di-attach belakangan). Tanpa LAN privat → 422. Sebaiknya kirim eksplisit |
 | `traffic_mode` | string persis `split` atau `full` | `split`; omit PUT mempertahankan mode |
+| `max_sessions` | integer JSON 1–3 (bukan string, float, atau boolean) | `3`; omit PUT mempertahankan nilai. `0`, negatif, `>3` → 422 |
 
 CIDR dinormalisasi dengan `strict=False`: misalnya `10.20.0.7/24` disimpan sebagai `10.20.0.0/24`. IPv6 tidak didukung. Default LAN berasal dari konfigurasi instalasi, bukan subnet universal. Jangan gunakan `0.0.0.0/0` dalam `allowed_cidrs`; gunakan `traffic_mode: "full"` untuk internet melalui VPN.
 
@@ -162,22 +164,32 @@ Jangan mengirim placeholder `***`/`[REDACTED]` sebagai password saat edit: itu b
 
 ### Respons akun dan runtime
 
-POST/PUT mengembalikan objek dengan **semua** field berikut (tanpa password): `id` integer, `username` string, `enabled` boolean, `allowed_cidrs` array string, `traffic_mode` string, `virtual_ip` string IPv4. GET list menambahkan field runtime pada **setiap** akun:
+POST/PUT mengembalikan objek dengan **semua** field berikut (tanpa password): `id` integer, `username` string, `enabled` boolean, `allowed_cidrs` array string, `traffic_mode` string, `max_sessions` integer 1–3, `virtual_ip` string IPv4, `extra_virtual_ips` array string IPv4 (read-only, panjang `max_sessions-1`). GET list dan GET detail `/api/users/{ident}` menambahkan field runtime pada **setiap** akun:
 
-| Field tambahan GET list | Bentuk / arti |
+| Field tambahan GET list/detail | Bentuk / arti |
 |---|---|
 | `runtime_status` | `Active`, `Down`, atau `Unknown` |
-| `session_count` | integer jumlah IKE ESTABLISHED dengan minimal satu CHILD INSTALLED; `null` bila Unknown |
+| `session_count` | integer jumlah IKE ESTABLISHED dengan minimal satu CHILD INSTALLED; `null` bila Unknown. UI menampilkan `session_count/max_sessions` |
 | `virtual_ips` | array string VIP yang teramati pada seluruh sesi cocok, bukan hanya sesi aktif; unik dan terurut |
 | `sessions` | array objek sesi cocok; kosong bila tidak ada atau Unknown |
 
 Setiap `sessions[]` mempunyai `ike_id` string atau null, `ike_state` string atau null, `remote_address` string atau null, `virtual_ips` array string, dan `children` array. Hanya CHILD berstatus INSTALLED dimasukkan ke `children`; setiap anak mempunyai `child_id` string atau null, `state: "INSTALLED"`, `bytes_in` integer, `bytes_out` integer. Counter adalah snapshot byte daemon, bukan bandwidth per detik. Jangan menganggap ID IKE/CHILD sebagai integer JSON.
 
-`Active` memerlukan IKE **ESTABLISHED** dan CHILD **INSTALLED**, dicocokkan dengan identitas EAP terautentikasi (fallback nama konfigurasi bila identitas tidak tersedia). `Down` berarti snapshot valid tanpa pasangan aktif, bukan sekadar `enabled=false`. `Unknown` berarti daemon gagal/timeout, output tidak lengkap/rusak, atau dry-run; nilainya `session_count:null`, `virtual_ips:[]`, `sessions:[]`. `enabled` hanya pengaturan administratif, bukan bukti koneksi. POST/PUT tidak menyertakan snapshot runtime; lakukan GET list lagi.
+`Active` memerlukan IKE **ESTABLISHED** dan CHILD **INSTALLED**, dicocokkan dengan identitas EAP terautentikasi (fallback nama konfigurasi bila identitas tidak tersedia). `Down` berarti snapshot valid tanpa pasangan aktif, bukan sekadar `enabled=false`. `Unknown` berarti daemon gagal/timeout, output tidak lengkap/rusak, atau dry-run; nilainya `session_count:null`, `virtual_ips:[]`, `sessions:[]`. `enabled` hanya pengaturan administratif, bukan bukti koneksi. POST/PUT tidak menyertakan snapshot runtime; lakukan GET list/detail lagi.
+
+### Batas sesi bersamaan (`max_sessions`)
+
+strongSwan tidak membatasi jumlah sesi EAP per akun, jadi backend menegakkannya sendiri:
+
+- Konfigurasi `user-<id>` memakai `unique = never` (sesi kedua tidak lagi menendang sesi pertama) dan `pools = pool-<id>,pool-<id>-2,...`: satu pool satu alamat per slot sesi. `virtual_ip` adalah VIP sesi pertama (yang ada di profil); `extra_virtual_ips` untuk sesi ke-2 dan ke-3. Semua VIP akun mendapat ACL, NAT dan clamp MSS yang sama. Setiap slot memakai satu lease dari pool /24, sehingga kapasitas berkurang; create/PUT yang tidak mendapat cukup lease → 409 tanpa perubahan.
+- Task latar di lifespan FastAPI, setiap 5 detik (`VPNAAS_SESSION_LIMIT_INTERVAL`), membaca snapshot lengkap `swanctl --list-sas --raw`, mengelompokkan IKE ESTABLISHED berdasarkan identitas EAP terautentikasi. Bila jumlah endpoint (`remote-host:port`) melebihi `max_sessions`, SA **terbaru** dihentikan dengan `swanctl --terminate --ike-id <uniqueid> --force`; `max_sessions` sesi tertua tetap hidup. Dua SA dari host:port yang sama (overlap reauth make-before-break) dihitung satu sesi.
+- Setiap penghentian ditulis ke journald (`vpnaas-sessions WARNING session limit: user id=... terminated IKE_SA #...`) dan audit `action:"session_limit"`. Dry-run, daemon gagal/timeout, atau snapshot rusak tidak menghentikan apa pun; kegagalan tidak mematikan API. Nonaktifkan task dengan `VPNAAS_SESSION_LIMIT=0`.
+- Klien surplus bisa terhubung sebentar (≤ ~5 detik) sebelum dihentikan; batas ini bukan penolakan pada saat IKE_AUTH. Menurunkan `max_sessions` lewat PUT juga merevoke sesi akun (seperti PUT lain), lalu klien harus reconnect.
+- Database lama dimigrasi otomatis (schema v2): akun tanpa field mendapat `max_sessions: 3` dan dua VIP tambahan; bila pool tidak cukup, nilai dipangkas dan dicatat di journal.
 
 ### Pool dan virtual IP
 
-Installer memilih satu `/24` bebas konflik dari rentang `172.31.201.0/24` sampai `172.31.250.0/24`, lalu menyimpannya sebagai `VPNAAS_POOL_CIDR`. Gunakan `pool_cidr` dari status untuk mengetahui pool server, jangan hardcode salah satu kandidat. VIP dialokasikan dari host bebas, disimpan per akun, dan tidak dihitung dari ID. Kapasitas 254 akun (akun disabled tetap memegang lease). Edit/restart/reinstall mempertahankan VIP; menghapus akun membebaskan lease. Perubahan pool bukan CRUD biasa: perlu backup, migrasi, dan reconnect; lihat [pool VIP](pool-vip.md).
+Installer memilih satu `/24` bebas konflik dari rentang `172.31.201.0/24` sampai `172.31.250.0/24`, lalu menyimpannya sebagai `VPNAAS_POOL_CIDR`. Gunakan `pool_cidr` dari status untuk mengetahui pool server, jangan hardcode salah satu kandidat. VIP dialokasikan dari host bebas, disimpan per akun, dan tidak dihitung dari ID. Kapasitas 254 lease; tiap akun memakai `max_sessions` lease (default 3, jadi ±84 akun default; akun disabled tetap memegang lease). Edit/restart/reinstall mempertahankan VIP; menghapus akun membebaskan lease. Perubahan pool bukan CRUD biasa: perlu backup, migrasi, dan reconnect; lihat [pool VIP](pool-vip.md).
 
 ### Profil akun: satu-satunya respons dengan password
 
@@ -197,7 +209,7 @@ curl --fail --silent --show-error -X DELETE \
 rm -f -- "$PROFILE_FILE"
 ```
 
-Respons profil JSON memuat `username`, **`password` plaintext**, `traffic_mode`, `server`, `server_id`, `virtual_ip`, `allowed_cidrs`, `ca_certificate`; full saja menambahkan `dns` array string IPv4. `server`/`server_id` memakai `VPNAAS_PUBLIC_IP` instalasi, bukan alamat loopback API. `ca_certificate` adalah PEM CA publik (string kosong bila file CA tidak ada), **bukan** private key. Tidak ada `id`, `enabled`, atau runtime di profil. Header: `Cache-Control: no-store` dan `Content-Disposition: attachment; filename="user-<ident>.json"`. No-store tidak mengenkripsi file di disk dan tidak mencegah logging oleh klien. API key maupun private CA/server key tidak dikembalikan.
+Respons profil JSON memuat `username`, **`password` plaintext**, `traffic_mode`, `server`, `server_id`, `virtual_ip`, `allowed_cidrs`, `ca_certificate`; full saja menambahkan `dns` array string IPv4. `server`/`server_id` memakai `VPNAAS_PUBLIC_IP` instalasi, bukan alamat loopback API. `ca_certificate` adalah PEM CA publik (string kosong bila file CA tidak ada), **bukan** private key. Tidak ada `id`, `enabled`, atau runtime di profil. Header: `Cache-Control: no-store` dan `Content-Disposition: attachment; filename="Profil-VPN-<username>.json"` bila diunduh lewat UI (API langsung: `user-<ident>.json`). No-store tidak mengenkripsi file di disk dan tidak mencegah logging oleh klien. API key maupun private CA/server key tidak dikembalikan.
 
 ## 4. Connections: S2S PSK
 
@@ -300,7 +312,7 @@ curl --fail --silent --show-error -X GET \
   - `pools`: string output `swanctl --list-pools`.
   - `backend`: string `strongSwan swanctl`.
   - `network`: hanya bila `VPNAAS_ROUTE_AUTO=1`; objek berisi `public_interface` (string/null), `private_routes` (array), `private_ready` (boolean), `mode` (`kernel-route-auto`). Tiap `private_routes[]` berisi `cidr` string, `interface` string/null, `ready` boolean. Daftar dihitung dari CIDR akun **enabled**, bukan seluruh selector S2S. `private_ready` adalah semua grant punya route aman; jika tidak ada grant, nilainya true. Ini bukan hasil ping host LAN.
-- **audit**: array objek dengan `id` integer, `timestamp` string SQLite `CURRENT_TIMESTAMP` (UTC, bentuk `YYYY-MM-DD HH:MM:SS`, tanpa suffix zona), `action` string `create/update/delete`, `resource` string `users/connections/policies`, `resource_id` integer ID objek. Audit hanya mencatat CRUD sukses setelah apply; tidak merekam login gagal, read, download profil, initiate/terminate, atau payload/credential. Maksimal 500 terbaru; bukan histori lengkap dengan pagination.
+- **audit**: array objek dengan `id` integer, `timestamp` string SQLite `CURRENT_TIMESTAMP` (UTC, bentuk `YYYY-MM-DD HH:MM:SS`, tanpa suffix zona), `action` string `create/update/delete/session_limit`, `resource` string `users/connections/policies`, `resource_id` integer ID objek. Audit mencatat CRUD sukses setelah apply dan penghentian sesi surplus oleh batas `max_sessions` (`session_limit`, `resource_id` = ID akun); tidak merekam login gagal, read, download profil, initiate/terminate, atau payload/credential. Maksimal 500 terbaru; bukan histori lengkap dengan pagination.
 
 Mode `VPNAAS_DRY_RUN=1` dipakai pengujian, bukan bukti daemon nyata. Status mode ini **hanya** `{"raw":"test mode (not daemon status)","connections":""}` dan runtime akun Unknown. Jangan membuat UI menganggap field status nyata selalu tersedia pada dry-run.
 
@@ -318,13 +330,14 @@ curl --silent --show-error -i "$API_BASE/api/health"
 | 401 | `Unauthorized` | Header hilang, kosong, atau tidak cocok |
 | 404 | `Not found` | ID tidak ada pada resource yang diminta |
 | 409 | `Name already exists` | Username/nama sudah dipakai dalam jenis resource yang sama |
-| 409 | `VIP pool exhausted (254 usable hosts)` | Tidak ada lease kosong; user baru tidak disisipkan |
+| 409 | `VIP pool exhausted (254 usable hosts; each session slot needs one)` | Lease kosong kurang dari jumlah slot `max_sessions`; user tidak disisipkan/diubah |
 | 409 | `Connection disabled` | Initiate pada koneksi nonaktif |
 | 409 | `User VIP missing; migrate database first` | Data lama belum mempunyai VIP saat profil/render membutuhkannya |
 | 409 | `Invalid persisted user VIP` | VIP tersimpan tidak valid bagi pool saat ini |
 | 422 | `Invalid request` | Validasi FastAPI: JSON rusak, body bukan objek, ID bukan integer, body wajib tidak ada, tipe header tidak sesuai |
 | 422 | `Unknown fields` | Body berisi field di luar daftar resource |
 | 422 | `traffic_mode must be split or full` | Mode eksplisit bukan nilai yang diizinkan |
+| 422 | `max_sessions must be an integer 1..3` | `max_sessions` bukan integer 1–3 |
 | 422 | `Invalid fields; credentials must be 8-128 safe printable characters` | Field wajib hilang/format salah, CIDR tidak valid, boolean salah, credential tidak valid, atau validasi bisnis lainnya; pesan generik ini tidak selalu berarti password penyebabnya |
 | 502 | `VPN configuration apply failed; previous configuration restored` | Penerapan konfigurasi/nft gagal |
 | 502 | `Unable to revoke existing VPN session` | Penghentian SA saat mutasi gagal |
