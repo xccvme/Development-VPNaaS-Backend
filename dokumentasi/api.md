@@ -13,4 +13,4 @@ Users runtime Active hanya jika authenticated IKE ESTABLISHED + CHILD INSTALLED;
 
 EAP discovery pertama meminta identitas; kandidat dummy tidak punya pool/CHILD dan mensyaratkan grup mustahil. Kandidat per-user memilih identitas EAP yang terautentikasi, bukan IKE IDi bebas klien. Jangan mengubah semua eap_id ke %any atau menambah grup/RADIUS tanpa mengaudit seleksi. strongSwan6.0.1 memerlukan paket Debian libcharon-extauth-plugins untuk EAP-MSCHAPv2; extra-plugins saja tidak cukup.
 
-Validation422, auth401, not-found404, duplicate409, apply failure502. Audit dan validation error tidak echo credential. Apply nyata memakai swanctl/nft, bukan seed telemetry. S2S peer end-to-end belum termasuk pengujian test2.
+Validation422, auth401, not-found404, duplicate409, apply failure502. Audit dan validation error tidak echo credential. Apply nyata memakai swanctl/nft, bukan seed telemetry. Keberhasilan initiate harus dikonfirmasi dengan IKE ESTABLISHED, CHILD INSTALLED, dan kenaikan counter trafik pada kedua peer.

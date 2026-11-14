@@ -8,4 +8,4 @@ Sebelum route privat ada: paket grant di-drop, `/api/status.network.private_rout
 
 Selector split tetap allowed_cidrs, tidak bergantung NIC. Mode full memakai selector0/0, internet masquerade lewat public default aktual, MSS1360, DNS push, blok private/reserved di luar LAN grants. ACL pool diproses sebelum ct established agar flow lama tidak lolos setelah detach. Mode full hanya IPv4: bukan IPv6 tunnel/kill-switch. Route policy multipath/table non-main belum didukung; gunakan route main eksplisit.
 
-test2 hanya ens3 public, tidak ada LAN produksi. Uji dummy hanya membuktikan late attach/route/NAT reconciliation, bukan akses LAN fisik. Jangan mengklaim subnet lama tersedia di VM ini.
+Pastikan subnet yang diizinkan benar-benar memiliki route melalui NIC privat pada gateway. Uji akses host LAN dan return route secara terpisah; NIC terdeteksi tidak otomatis membuktikan konektivitas seluruh LAN.

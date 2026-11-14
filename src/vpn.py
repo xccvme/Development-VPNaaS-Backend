@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from store import rows
 CONF=pathlib.Path('/etc/swanctl/conf.d/vpnaas.conf')
 PUBLIC_IF=os.environ.get('VPNAAS_PUBLIC_IF','ens3')
-PUBLIC_IP=os.environ.get('VPNAAS_PUBLIC_IP','38.47.77.54')
+PUBLIC_IP=os.environ.get('VPNAAS_PUBLIC_IP','203.0.113.10')
 LAN_IF=os.environ.get('VPNAAS_LAN_IF','ens8')
 LAN_IP=os.environ.get('VPNAAS_LAN_IP','10.10.7.14')
 LAN_CIDR=os.environ.get('VPNAAS_LAN_CIDR','10.10.7.0/24')

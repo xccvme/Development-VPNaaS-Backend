@@ -100,7 +100,7 @@ def profile(ident:int):
     ca=Path('/etc/swanctl/x509ca/ca.pem')
     from vpn import vip,full_dns
     mode=u.get('traffic_mode','split')
-    data=dict(username=u['username'],password=u['password'],traffic_mode=mode,server=os.environ.get('VPNAAS_PUBLIC_IP','38.47.77.54'),server_id=os.environ.get('VPNAAS_PUBLIC_IP','38.47.77.54'),virtual_ip=vip(u),allowed_cidrs=u['allowed_cidrs'],ca_certificate=ca.read_text() if ca.exists() else '')
+    data=dict(username=u['username'],password=u['password'],traffic_mode=mode,server=os.environ.get('VPNAAS_PUBLIC_IP','203.0.113.10'),server_id=os.environ.get('VPNAAS_PUBLIC_IP','203.0.113.10'),virtual_ip=vip(u),allowed_cidrs=u['allowed_cidrs'],ca_certificate=ca.read_text() if ca.exists() else '')
     if mode=='full':data['dns']=full_dns()
     return JSONResponse(data,headers={'Cache-Control':'no-store','Content-Disposition':f'attachment; filename="user-{ident}.json"'})
 @app.post('/api/connections/{ident}/initiate',dependencies=[Depends(authorize)])

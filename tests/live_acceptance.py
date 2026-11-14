@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run on installed gateway as root. Never prints keys or profile credentials."""
 import json
+import os
 import secrets
 import urllib.request
 from pathlib import Path
@@ -18,7 +19,7 @@ try:
         created.append(('users',u['id']))
         assert 'password' not in u
         profile=api(f"users/{u['id']}/profile")
-        assert profile['server']=='38.47.85.19' and profile['traffic_mode']==mode
+        assert profile['server']==os.environ['VPNAAS_PUBLIC_IP'] and profile['traffic_mode']==mode
         runtime=next(x for x in api('users') if x['id']==u['id'])
         assert runtime['runtime_status']=='Down' and runtime['session_count']==0
         api(f"users/{u['id']}",dict(password=secrets.token_hex(18),enabled=False),'PUT')

@@ -97,7 +97,7 @@ def test_firewall_full_user_gets_internet_snat_but_private_ranges_stay_restricte
     assert allow < deny < inet
     for private in ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10', '169.254.0.0/16', '224.0.0.0/3']:
         assert private in lines[deny]
-    assert f'ip saddr {vip} oifname "ens3" snat to 38.47.77.54' in lines
+    assert f'ip saddr {vip} oifname "ens3" snat to 203.0.113.10' in lines
     # split users unchanged: no internet accept, no ens3 snat
     for split_vip in ['10.250.0.4', '10.250.0.10']:
         assert f'ip saddr {split_vip} ip daddr 10.10.7.0/24 accept' in lines

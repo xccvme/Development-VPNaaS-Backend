@@ -27,6 +27,5 @@ Buka **UDP 500/4500** pada firewall platform. API tetap di **`127.0.0.1:8000`**,
 - [API dan fitur](dokumentasi/api.md)
 - [NIC privat dipasang belakangan](dokumentasi/jaringan.md)
 - [Panduan Windows](dokumentasi/windows.md)
-- [Hasil pengujian test2](dokumentasi/pengujian.md)
 
 Source di `src/`. Bangun ulang script setelah perubahan: `python3 build-installer.py`. Pengujian: buat venv, pasang `src/requirements.txt pytest httpx`, lalu `PYTHONPATH=src python -m pytest tests -q`.
