@@ -21,6 +21,8 @@ def migrate(conn):
 
 db.commit()
 migrate(db)
+from pool import migrate as migrate_pool
+migrate_pool(db)
 
 def rows(kind):
     return [dict(json.loads(b),id=i) for i,b in db.execute('SELECT id,body FROM objects WHERE kind=? ORDER BY id',(kind,))]
@@ -64,6 +66,9 @@ def validate(kind,body,old=None):
             # 0/0 is expressed by traffic_mode=full, never as a LAN grant.
             if any(c.endswith('/0') for c in data['allowed_cidrs']):raise ValueError()
             data.setdefault('traffic_mode','split')
+            if 'virtual_ip' not in data:
+                from pool import allocate
+                data['virtual_ip']=allocate(rows('users'))
             if data['traffic_mode'] not in TRAFFIC_MODES:raise ValueError()
         else:
             data['name']=safe(data['name']);data['source_cidr']=cidr(data['source_cidr']);data['destination_cidr']=cidr(data['destination_cidr'])

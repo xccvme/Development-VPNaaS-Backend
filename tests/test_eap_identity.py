@@ -3,9 +3,9 @@ from vpn import render, firewall
 
 
 def test_identity_request_is_non_authorizing_before_per_user_candidates():
-    users = [dict(id=3, username='poc-client', password='test-only-a', enabled=True,
+    users = [dict(id=3, virtual_ip='172.31.201.4', username='poc-client', password='test-only-a', enabled=True,
                   allowed_cidrs=['10.10.7.0/24']),
-             dict(id=9, username='boss-windows', password='test-only-b', enabled=True,
+             dict(id=9, virtual_ip='172.31.201.10', username='boss-windows', password='test-only-b', enabled=True,
                   allowed_cidrs=['10.10.7.8/32'])]
     text = render([], users)
     # strongSwan <6.0.2 needs an initial, unfulfillable group constraint to
@@ -19,8 +19,8 @@ def test_identity_request_is_non_authorizing_before_per_user_candidates():
     assert text.index('c2s-eap-discovery {') < text.index('user-3 {')
     assert 'eap_id = poc-client' in text and 'eap_id = boss-windows' in text
     assert 'pools = pool-3' in text and 'pools = pool-9' in text
-    assert 'addrs = 10.250.0.4' in text and 'addrs = 10.250.0.10' in text
+    assert 'addrs = 172.31.201.4' in text and 'addrs = 172.31.201.10' in text
     assert 'local_ts = 10.10.7.8/32' in text
     rules = firewall([], users, [])
-    assert 'ip saddr 10.250.0.10 ip daddr 10.10.7.8/32 accept' in rules
-    assert 'ip saddr 10.250.0.10 ip daddr 10.10.7.0/24 accept' not in rules
+    assert 'ip saddr 172.31.201.10 ip daddr 10.10.7.8/32 accept' in rules
+    assert 'ip saddr 172.31.201.10 ip daddr 10.10.7.0/24 accept' not in rules

@@ -7,6 +7,17 @@ LAN_CIDR="${LAN_CIDR:-}"
 LAN_IF="${LAN_IF:-}"
 LAN_IP="${LAN_IP:-}"
 FULL_DNS="${FULL_DNS:-}"
+# Numeric sysctl overrides; defaults fit a small VM, not throughput guarantees.
+export TUNE_NET_CORE_RMEM_MAX="${TUNE_NET_CORE_RMEM_MAX:-16777216}"
+export TUNE_NET_CORE_WMEM_MAX="${TUNE_NET_CORE_WMEM_MAX:-16777216}"
+export TUNE_NET_CORE_RMEM_DEFAULT="${TUNE_NET_CORE_RMEM_DEFAULT:-1048576}"
+export TUNE_NET_CORE_WMEM_DEFAULT="${TUNE_NET_CORE_WMEM_DEFAULT:-1048576}"
+export TUNE_NET_CORE_OPTMEM_MAX="${TUNE_NET_CORE_OPTMEM_MAX:-65536}"
+export TUNE_NET_CORE_NETDEV_MAX_BACKLOG="${TUNE_NET_CORE_NETDEV_MAX_BACKLOG:-16384}"
+export TUNE_NET_IPV4_TCP_RMEM="${TUNE_NET_IPV4_TCP_RMEM:-4096 87380 16777216}"
+export TUNE_NET_IPV4_TCP_WMEM="${TUNE_NET_IPV4_TCP_WMEM:-4096 65536 16777216}"
+export TUNE_NET_NETFILTER_NF_CONNTRACK_MAX="${TUNE_NET_NETFILTER_NF_CONNTRACK_MAX:-262144}"
+export TUNE_FS_FILE_MAX="${TUNE_FS_FILE_MAX:-2097152}"
 export PUBLIC_IP PUBLIC_IF LAN_CIDR LAN_IF LAN_IP FULL_DNS
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 . /etc/os-release
@@ -14,8 +25,34 @@ export PUBLIC_IP PUBLIC_IF LAN_CIDR LAN_IF LAN_IP FULL_DNS
 export DEBIAN_FRONTEND=noninteractive
 umask 077
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl openssl python3 python3-venv nftables iproute2 charon-systemd strongswan-swanctl strongswan-pki libcharon-extra-plugins libcharon-extauth-plugins libstrongswan-extra-plugins libstrongswan-standard-plugins
+apt-get install -y --no-install-recommends ca-certificates curl openssl python3 python3-venv nftables iproute2 ethtool kmod charon-systemd strongswan-swanctl strongswan-pki libcharon-extra-plugins libcharon-extauth-plugins libstrongswan-extra-plugins libstrongswan-standard-plugins
 install -d -m 700 /opt/vpnaas/backend /var/lib/vpnaas /etc/vpnaas /etc/swanctl/conf.d /etc/swanctl/private /etc/swanctl/x509 /etc/swanctl/x509ca
+# Back up state before configuration or schema changes; never expose credentials.
+python3 - <<'BACKUP'
+from pathlib import Path
+import datetime, shutil, sqlite3, json, subprocess
+root=Path('/var/backups/vpnaas')/datetime.datetime.now().strftime('%Y%m%dT%H%M%S.%f')
+root.mkdir(parents=True,mode=0o700)
+for source in ('/etc/vpnaas','/etc/swanctl','/etc/sysctl.d/99-vpn-tuning.conf','/etc/modules-load.d/vpnaas.conf','/var/lib/vpnaas/ca-key.pem'):
+    p=Path(source)
+    if p.exists():
+        target=root/source.lstrip('/')
+        target.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copytree(p,target) if p.is_dir() else shutil.copy2(p,target)
+p=Path('/var/lib/vpnaas/data.sqlite3')
+if p.exists():
+    conn=sqlite3.connect(p)
+    dest=sqlite3.connect(root/'data.sqlite3');conn.backup(dest);dest.close()
+    legacy=[i for i,b in conn.execute("SELECT id,body FROM objects WHERE kind='users'") if not json.loads(b).get('virtual_ip')]
+    conn.close()
+    if legacy:
+        subprocess.run(['systemctl','stop','vpnaas-reconcile.timer','vpnaas-api.service'],check=True)
+        for ident in legacy:
+            r=subprocess.run(['swanctl','--terminate','--ike','user-'+str(ident),'--timeout','5'],capture_output=True,text=True,timeout=10)
+            if r.returncode and 'no matching' not in (r.stdout+r.stderr).lower():raise SystemExit('Cannot safely terminate legacy user session')
+        print('Legacy VIP migration: user sessions terminated; reconnect after install')
+print('Backup: '+str(root))
+BACKUP
 python3 - <<'CONFIG'
 import os, json, subprocess, ipaddress, re
 from pathlib import Path
@@ -35,7 +72,7 @@ for k in ('PUBLIC_IF','LAN_IF'):
     if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}',values[k]) or not Path('/sys/class/net',values[k]).exists():raise SystemExit('Invalid interface '+k)
 values['FULL_DNS']=','.join(str(ipaddress.IPv4Address(x.strip())) for x in values['FULL_DNS'].split(','))
 if not 1<=len(values['FULL_DNS'].split(','))<=4:raise SystemExit('Set 1-4 DNS servers')
-path.write_text(''.join('VPNAAS_'+k+'='+v+'\n' for k,v in values.items())+'VPNAAS_DB=/var/lib/vpnaas/data.sqlite3\nVPNAAS_ROUTE_AUTO=1\n')
+path.write_text(''.join('VPNAAS_'+k+'='+v+'\n' for k,v in values.items())+'VPNAAS_DB=/var/lib/vpnaas/data.sqlite3\nVPNAAS_ROUTE_AUTO=1\n'+('VPNAAS_POOL_CIDR='+old['VPNAAS_POOL_CIDR']+'\n' if old.get('VPNAAS_POOL_CIDR') else ''))
 path.chmod(0o600)
 key=Path('/etc/vpnaas/api.key')
 if not key.exists():
@@ -46,10 +83,14 @@ key.chmod(0o600)
 if not lan and values['LAN_CIDR']=='192.0.2.0/24':print('No private LAN detected: safe placeholder 192.0.2.0/24. Set LAN_CIDR/LAN_IF/LAN_IP before LAN use.')
 print('Gateway '+values['PUBLIC_IP']+' via '+values['PUBLIC_IF']+'; LAN '+values['LAN_CIDR']+' via '+values['LAN_IF'])
 CONFIG
-# The archive contains only the five allowlisted application source files.
+# Stop readers before replacing source: they must never observe new code with old env.
+systemctl stop vpnaas-reconcile.timer vpnaas-reconcile.service vpnaas-api.service 2>/dev/null || true
+# The archive contains only explicitly allowlisted source files.
 base64 -d <<'VPNAAS_PAYLOAD' | tar -xz --no-same-owner -C /opt/vpnaas/backend
 @@PAYLOAD@@
 VPNAAS_PAYLOAD
+systemctl enable --now strongswan.service
+python3 /opt/vpnaas/backend/pool.py
 python3 -m venv /opt/vpnaas/backend/venv
 /opt/vpnaas/backend/venv/bin/pip install --disable-pip-version-check -r /opt/vpnaas/backend/requirements.txt
 set -a
@@ -75,8 +116,7 @@ export VPNAAS_API_KEY="$(</etc/vpnaas/api.key)"
 exec "$@"
 RUN
 chmod 700 /opt/vpnaas/backend/run
-printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-vpnaas.conf
-sysctl -p /etc/sysctl.d/90-vpnaas.conf
+python3 /opt/vpnaas/backend/tuning.py --configure
 cat > /etc/systemd/system/vpnaas-api.service <<'UNIT'
 [Unit]
 Description=VPNaaS backend (loopback)
@@ -92,6 +132,7 @@ ExecStartPre=/opt/vpnaas/backend/run /opt/vpnaas/backend/venv/bin/python -c "fro
 ExecStart=/opt/vpnaas/backend/run /opt/vpnaas/backend/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --no-access-log
 Restart=always
 RestartSec=3
+LimitNOFILE=65536
 UMask=0077
 PrivateTmp=true
 ProtectHome=true
@@ -122,7 +163,29 @@ AccuracySec=1
 [Install]
 WantedBy=timers.target
 TIMER
+cat > /etc/systemd/system/vpnaas-offload.service <<'OFFLOAD'
+[Unit]
+Description=VPNaaS public NIC offload readiness (does not change MTU)
+After=network-online.target
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/vpnaas/backend
+ExecStart=/usr/bin/python3 /opt/vpnaas/backend/tuning.py
+OFFLOAD
+cat > /etc/systemd/system/vpnaas-offload.timer <<'OFFTIMER'
+[Unit]
+Description=Recheck offloads after NIC and public route changes
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=2
+[Install]
+WantedBy=timers.target
+OFFTIMER
+install -d /etc/systemd/system/strongswan.service.d
+printf '[Service]\nLimitNOFILE=65536\n' > /etc/systemd/system/strongswan.service.d/limits.conf
 systemctl daemon-reload
+systemctl enable --now vpnaas-offload.timer
 systemctl enable --now vpnaas-reconcile.timer
 systemctl enable --now strongswan.service
 systemctl enable vpnaas-api.service

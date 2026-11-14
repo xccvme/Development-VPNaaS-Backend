@@ -10,5 +10,5 @@ def test_validation_error_never_echoes_credentials():
 def test_c2s_plaintext_spoof_cannot_fallthrough_global_policy():
  from vpn import firewall
  text=firewall([],[],[dict(id=1,name='broad',source_cidr='0.0.0.0/0',destination_cidr='0.0.0.0/0',protocol='all',enabled=True)])
- assert 'ip saddr 10.250.0.0/24 drop' in text
- assert text.index('ip saddr 10.250.0.0/24 drop') < text.index('ip saddr 0.0.0.0/0')
+ assert 'ip saddr 172.31.201.0/24 drop' in text
+ assert text.index('ip saddr 172.31.201.0/24 drop') < text.index('ip saddr 0.0.0.0/0')

@@ -1,0 +1,101 @@
+"""Persistent server pool selection and ID-independent host leases."""
+import ipaddress
+import json
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import fcntl
+
+
+def network():
+    net=ipaddress.IPv4Network(os.environ.get('VPNAAS_POOL_CIDR','172.31.201.0/24'))
+    if net.prefixlen!=24 or not net.subnet_of(ipaddress.ip_network('172.31.0.0/16')) or not 201<=int(str(net.network_address).split('.')[2])<=250:
+        raise ValueError('VPNAAS_POOL_CIDR must be 172.31.201..250.0/24')
+    return net
+
+
+def choose(occupied):
+    nets=[ipaddress.ip_network(x,strict=False) for x in occupied if x not in ('default','0.0.0.0/0')]
+    candidates=[f'172.31.{n}.0/24' for n in range(201,251) if not any(ipaddress.ip_network(f'172.31.{n}.0/24').overlaps(x) for x in nets if x.version==4)]
+    if not candidates:raise ValueError('No conflict-free server VIP pool remains')
+    return secrets.choice(candidates)
+
+
+def ensure(path,occupied):
+    path=Path(path)
+    lock=path.with_suffix('.pool.lock')
+    with lock.open('a') as handle:
+        os.chmod(lock,0o600)
+        fcntl.flock(handle,fcntl.LOCK_EX)
+        text=path.read_text() if path.exists() else ''
+        for line in text.splitlines():
+            if line.startswith('VPNAAS_POOL_CIDR='):
+                value=line.split('=',1)[1]
+                old=os.environ.get('VPNAAS_POOL_CIDR')
+                try:
+                    os.environ['VPNAAS_POOL_CIDR']=value
+                    network()
+                finally:
+                    if old is None:os.environ.pop('VPNAAS_POOL_CIDR',None)
+                    else:os.environ['VPNAAS_POOL_CIDR']=old
+                return value
+        value=choose(occupied)
+        temporary=path.with_suffix('.pool.tmp')
+        fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(fd,'w') as f:
+            f.write(text.rstrip()+'\nVPNAAS_POOL_CIDR='+value+'\n');f.flush();os.fsync(f.fileno())
+        os.replace(temporary,path)
+        return value
+
+
+def allocate(users):
+    from fastapi import HTTPException
+    used={u.get('virtual_ip') for u in users}
+    for host in network().hosts():
+        if str(host) not in used:return str(host)
+    raise HTTPException(409,'VIP pool exhausted (254 usable hosts)')
+
+
+def migrate(conn):
+    users=[(i,json.loads(b)) for i,b in conn.execute("SELECT id,body FROM objects WHERE kind='users' ORDER BY id")]
+    used=set()
+    for _,u in users:
+        value=u.get('virtual_ip')
+        if value:
+            addr=ipaddress.IPv4Address(value)
+            if addr not in network() or addr in (network().network_address,network().broadcast_address) or value in used:
+                raise ValueError('Invalid or duplicate VIP; explicit backed-up migration required')
+            used.add(value)
+    for i,u in users:
+        if not u.get('virtual_ip'):
+            u['virtual_ip']=allocate([{'virtual_ip':v} for v in used]);used.add(u['virtual_ip'])
+            conn.execute('UPDATE objects SET body=? WHERE id=?',(json.dumps(u),i))
+    conn.commit()
+
+
+if __name__=='__main__':
+    path=Path('/etc/vpnaas/backend.env')
+    routes=json.loads(subprocess.check_output(['ip','-j','-4','route','show','table','all']))
+    occupied=[r['dst'] for r in routes if r.get('dst') and r['dst']!='default']
+    # Other engines/administratively configured strongSwan pools may not be in DB.
+    import re
+    result=subprocess.run(['swanctl','--list-pools'],capture_output=True,text=True)
+    if result.returncode:raise SystemExit('Cannot inspect existing strongSwan pools safely')
+    occupied.extend(re.findall(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?',result.stdout))
+    ip=r'(?:\d{1,3}\.){3}\d{1,3}'
+    for first,last in re.findall('('+ip+r')\s*(?:-|\.\.)\s*('+ip+')',result.stdout):
+        occupied.extend(str(n) for n in ipaddress.summarize_address_range(ipaddress.IPv4Address(first),ipaddress.IPv4Address(last)))
+    env=dict(l.split('=',1) for l in path.read_text().splitlines() if '=' in l)
+    if env.get('VPNAAS_LAN_CIDR'):occupied.append(env['VPNAAS_LAN_CIDR'])
+    import sqlite3
+    db=Path(env.get('VPNAAS_DB','/var/lib/vpnaas/data.sqlite3'))
+    if db.exists():
+        conn=sqlite3.connect(db)
+        for kind,body in conn.execute('SELECT kind,body FROM objects'):
+            u=json.loads(body)
+            occupied.extend(u.get('allowed_cidrs',[]))
+            occupied.extend(u[k] for k in ('local_ts','remote_ts','source_cidr','destination_cidr') if k in u)
+            if u.get('virtual_ip'):occupied.append(u['virtual_ip']+'/32')
+        conn.close()
+    print('Server VIP pool: '+ensure(path,occupied))

@@ -27,5 +27,9 @@ Buka **UDP 500/4500** pada firewall platform. API tetap di **`127.0.0.1:8000`**,
 - [API dan fitur](dokumentasi/api.md)
 - [NIC privat dipasang belakangan](dokumentasi/jaringan.md)
 - [Panduan Windows](dokumentasi/windows.md)
+- [Pool VIP acak per server dan migrasi](dokumentasi/pool-vip.md)
+- [Tuning kernel, jaringan, MTU/MSS dan rollback](dokumentasi/tuning-kernel-network.md)
+
+Pool /24 dipilih sekali dari `172.31.201..250.0/24` lalu disimpan di environment; reinstall mempertahankan pool, lease, DB, PKI dan API key. Tuning tidak memasang OpenVPN/WireGuard; preset kedua engine masih nonaktif.
 
 Source di `src/`. Bangun ulang script setelah perubahan: `python3 build-installer.py`. Pengujian: buat venv, pasang `src/requirements.txt pytest httpx`, lalu `PYTHONPATH=src python -m pytest tests -q`.

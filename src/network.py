@@ -37,11 +37,13 @@ def diagnostics(users):
 
 def route_firewall(text,users):
     from vpn import vip, PUBLIC_IF, PUBLIC_IP
+    from pool import network
+    pool=str(network())
     routes=snapshot(); public=public_interface(routes)
     text=text.replace(f'oifname "{PUBLIC_IF}"',f'oifname "{public or "__no_route__"}"')
     lines=text.splitlines(); out=[]; nat=[]
     for line in lines:
-        if line.startswith('ip saddr 10.250.0.0/24 ip daddr ') and ' snat to ' in line:continue
+        if line.startswith(f'ip saddr {pool} ip daddr ') and ' snat to ' in line:continue
         if ' snat to ' in line:
             line=line.split(' snat to ')[0]+' masquerade'
         for u in users:
@@ -58,7 +60,7 @@ def route_firewall(text,users):
     # detached private routes must not leak an existing flow via public default.
     established='ct state established,related accept'
     out.remove(established)
-    idx=out.index('ip saddr 10.250.0.0/24 drop')+1
+    idx=out.index(f'ip saddr {pool} drop')+1
     out.insert(idx,established)
     return '\n'.join(out)+'\n'
 

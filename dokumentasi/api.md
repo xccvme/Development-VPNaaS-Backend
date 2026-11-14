@@ -9,7 +9,7 @@ Semua `/api/*` memakai header `X-API-Key`; key0600 `/etc/vpnaas/api.key`. Respon
 - GET/POST `/api/policies`, PUT/DELETE `/{id}`: name, source_cidr, destination_cidr, protocol(all/tcp/udp/icmp), enabled. Policy global tidak melewati ACL mandatory C2S.
 - GET status → raw SAs/connections/pools dan network diagnostics; GET audit → metadata operasi tanpa rahasia.
 
-Users runtime Active hanya jika authenticated IKE ESTABLISHED + CHILD INSTALLED; Down jika snapshot valid tanpa SA, Unknown jika daemon gagal dibaca. enabled bukan indikator tersambung. Perubahan akun/koneksi mencabut SA terkait. Fixed VIP10.250.0.(globalID+1), batas global ID253; kapasitas PoC ini termasuk ID objek lain.
+Users runtime Active hanya jika authenticated IKE ESTABLISHED + CHILD INSTALLED; Down jika snapshot valid tanpa SA, Unknown jika daemon gagal dibaca. enabled bukan indikator tersambung. Perubahan akun/koneksi mencabut SA terkait. VIP disimpan sebagai virtual_ip per user, independen dari ID objek; kapasitas satu pool /24 adalah 254 host. Status menampilkan pool_cidr. Lihat [pool VIP dan migrasi](pool-vip.md).
 
 EAP discovery pertama meminta identitas; kandidat dummy tidak punya pool/CHILD dan mensyaratkan grup mustahil. Kandidat per-user memilih identitas EAP yang terautentikasi, bukan IKE IDi bebas klien. Jangan mengubah semua eap_id ke %any atau menambah grup/RADIUS tanpa mengaudit seleksi. strongSwan6.0.1 memerlukan paket Debian libcharon-extauth-plugins untuk EAP-MSCHAPv2; extra-plugins saja tidak cukup.
 

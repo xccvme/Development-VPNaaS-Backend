@@ -11,7 +11,7 @@ LAN_CIDR=os.environ.get('VPNAAS_LAN_CIDR','10.10.7.0/24')
 # Full-tunnel users may reach the internet but never these non-public ranges
 # (other than their own allowed_cidrs, accepted earlier). Includes the VIP pool.
 NON_PUBLIC='{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 }'
-FULL_MSS=1360
+FULL_MSS=1300
 
 def full_dns():
     import ipaddress
@@ -29,8 +29,14 @@ def run(args,timeout=20,input=None):
     return result.stdout
 
 def vip(user):
-    if user['id']>253:raise HTTPException(409,'PoC fixed VIP capacity exhausted (global ID >253)')
-    return '10.250.0.'+str(user['id']+1)
+    from pool import network
+    import ipaddress
+    value=user.get('virtual_ip')
+    if not value:raise HTTPException(409,'User VIP missing; migrate database first')
+    addr=ipaddress.IPv4Address(value)
+    if addr not in network() or addr in (network().network_address,network().broadcast_address):
+        raise HTTPException(409,'Invalid persisted user VIP')
+    return str(addr)
 
 def render(connections,users):
     lines=['connections {']
@@ -121,23 +127,32 @@ def render(connections,users):
     return '\n'.join(lines)+'\n'
 
 def firewall(connections,users,policies):
+    from pool import network
+    pool=str(network())
     lines=['table inet vpnaas {','chain users {']
     for u in users:
         if u['enabled']:
-            if is_full(u):lines.append(f'ip saddr {vip(u)} ip daddr 10.250.0.0/24 drop')
+            if is_full(u):lines.append(f'ip saddr {vip(u)} ip daddr {pool} drop')
             for dest in u['allowed_cidrs']:lines.append(f'ip saddr {vip(u)} ip daddr {dest} accept')
             if is_full(u):
                 lines.append(f'ip saddr {vip(u)} ip daddr {NON_PUBLIC} drop')
                 lines.append(f'ip saddr {vip(u)} oifname "{PUBLIC_IF}" accept')
     full=[vip(u) for u in users if u['enabled'] and is_full(u)]
-    lines+=['drop','}','chain forward { type filter hook forward priority 0; policy drop;']
-    for v in full:
-        # Internet paths see a 9000-byte ens3 MTU; clamp TCP below IPsec overhead.
-        lines.append(f'ip saddr {v} tcp flags & (syn|rst) == syn tcp option maxseg size set {FULL_MSS}')
-        lines.append(f'ip daddr {v} tcp flags & (syn|rst) == syn tcp option maxseg size set {FULL_MSS}')
+    lines+=['drop']
+    lines+=['}', 'chain mss { type filter hook forward priority mangle; policy accept;']
+    for u in users:
+        if not u['enabled']:continue
+        v=vip(u)
+        lines.append(f'ip saddr {v} meta ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+        lines.append(f'ip daddr {v} rt ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+    for c in connections:
+        if not c['enabled']:continue
+        for source,dest,match in ((c['remote_ts'],c['local_ts'],'meta'),(c['local_ts'],c['remote_ts'],'rt')):
+            lines.append(f'ip saddr {source} ip daddr {dest} {match} ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+    lines+=['}', 'chain forward { type filter hook forward priority 0; policy drop;']
     lines+=['ct state established,related accept',
-            'ip saddr 10.250.0.0/24 meta ipsec exists jump users',
-            'ip saddr 10.250.0.0/24 drop']
+            f'ip saddr {pool} meta ipsec exists jump users',
+            f'ip saddr {pool} drop']
     for c in connections:
         if c['enabled']:
             lines.append(f'ip saddr {c["remote_ts"]} ip daddr {c["local_ts"]} meta ipsec exists accept')
@@ -148,7 +163,7 @@ def firewall(connections,users,policies):
             # C2S is intercepted above; broad global policy cannot bypass per-user permissions.
             lines.append(f'ip saddr {p["source_cidr"]} ip daddr {p["destination_cidr"]} {proto}accept')
     lines+=['}','chain nat { type nat hook postrouting priority srcnat; policy accept;',
-            f'ip saddr 10.250.0.0/24 ip daddr {LAN_CIDR} oifname "{LAN_IF}" snat to {LAN_IP}']
+            f'ip saddr {pool} ip daddr {LAN_CIDR} oifname "{LAN_IF}" snat to {LAN_IP}']
     lines+=[f'ip saddr {v} oifname "{PUBLIC_IF}" snat to {PUBLIC_IP}' for v in full]
     lines+=['}','}']
     text='\n'.join(lines)+'\n'
@@ -220,7 +235,8 @@ def revoke(kind,ident):
         raise HTTPException(502,'Unable to revoke existing VPN session')
 
 def status():
-    return {'raw':run(['swanctl','--list-sas']), 'connections':run(['swanctl','--list-conns']),
+    from pool import network
+    return {'pool_cidr':str(network()),'raw':run(['swanctl','--list-sas']), 'connections':run(['swanctl','--list-conns']),
             'pools':run(['swanctl','--list-pools']), 'backend':'strongSwan swanctl'}
 
 def action(connection,operation):

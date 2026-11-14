@@ -20,7 +20,7 @@ def swan(*args,check=True):return run('ip','netns','exec',NS,'swanctl',*args,'--
 user=None;proc=None
 try:
     BASE.mkdir(mode=0o700)
-    user=api('users',{'username':'acceptance-tunnel','password':__import__('secrets').token_hex(18),'allowed_cidrs':['192.0.2.0/24'],'traffic_mode':'full'},'POST')
+    user=api('users',{'username':'acceptance-tunnel','password':__import__('secrets').token_hex(18),'allowed_cidrs':[os.environ.get('PROBE_LAN_CIDR','192.0.2.0/24')],'traffic_mode':'full'},'POST')
     profile=api(f"users/{user['id']}/profile")
     run('ip','netns','add',NS)
     run('ip','link','add',VETH,'type','veth','peer','name','vpnc-peer')
@@ -87,6 +87,9 @@ secrets { eap-check { id = acceptance-tunnel
     egress=run('ip','netns','exec',NS,'curl','-4','--noproxy','*','--resolve','ifconfig.me:443:34.160.111.145','--max-time','25','-sS','https://ifconfig.me/ip').strip()
     assert egress==profile['server'],egress
     print('PASS full HTTPS public egress '+egress)
+    if os.environ.get('PROBE_LAN_TARGET'):
+        print(run('ip','netns','exec',NS,'ping','-I',profile['virtual_ip'],'-c','3','-W','3',os.environ['PROBE_LAN_TARGET']))
+        print('PASS forwarded LAN target via negotiated VIP')
     print(swan('--list-sas'))
     api(f"users/{user['id']}",{'enabled':False},'PUT')
     runtime=next(x for x in api('users') if x['id']==user['id'])

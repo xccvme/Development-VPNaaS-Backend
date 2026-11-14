@@ -63,9 +63,9 @@ def test_full_dns_is_configurable_and_validated(monkeypatch):
     assert vpn.full_dns() == ['1.1.1.1', '8.8.8.8']
 
 
-USERS = [dict(id=3, username='poc-client', password='***', enabled=True, allowed_cidrs=['10.10.7.0/24'], traffic_mode='split'),
-         dict(id=9, username='boss-windows', password='***', enabled=True, allowed_cidrs=['10.10.7.0/24']),
-         dict(id=20, username='roamer', password='***', enabled=True, allowed_cidrs=['10.10.7.42/32'], traffic_mode='full')]
+USERS = [dict(id=3,virtual_ip='172.31.201.4', username='poc-client', password='***', enabled=True, allowed_cidrs=['10.10.7.0/24'], traffic_mode='split'),
+         dict(id=9,virtual_ip='172.31.201.10', username='boss-windows', password='***', enabled=True, allowed_cidrs=['10.10.7.0/24']),
+         dict(id=20,virtual_ip='172.31.201.21', username='roamer', password='***', enabled=True, allowed_cidrs=['10.10.7.42/32'], traffic_mode='full')]
 
 
 def block(text, name):
@@ -80,9 +80,9 @@ def test_render_full_user_uses_default_selector_and_dns_pool():
     assert 'eap_id = roamer' in block(text, 'user-20')
     assert 'local_ts = 10.10.7.0/24' in block(text, 'user-3')
     assert 'local_ts = 10.10.7.0/24' in block(text, 'user-9')
-    assert 'pool-20 { addrs = 10.250.0.21\n dns = 1.1.1.1,8.8.8.8\n }' in text
+    assert 'pool-20 { addrs = 172.31.201.21\n dns = 1.1.1.1,8.8.8.8\n }' in text
     # split pools are byte-identical to the pre-change rendering
-    assert 'pool-3 { addrs = 10.250.0.4\n }' in text and 'pool-9 { addrs = 10.250.0.10\n }' in text
+    assert 'pool-3 { addrs = 172.31.201.4\n }' in text and 'pool-9 { addrs = 172.31.201.10\n }' in text
     assert 'aes256-sha256-modp2048' in block(text, 'user-20') and 'esp_proposals = aes256-sha256' in block(text, 'user-20')
 
 
@@ -90,7 +90,7 @@ def test_firewall_full_user_gets_internet_snat_but_private_ranges_stay_restricte
     from vpn import firewall
     rules = firewall([], USERS, [])
     lines = rules.splitlines()
-    vip = '10.250.0.21'
+    vip = '172.31.201.21'
     allow = lines.index(f'ip saddr {vip} ip daddr 10.10.7.42/32 accept')
     deny = next(i for i, l in enumerate(lines) if l.startswith(f'ip saddr {vip} ip daddr {{') and l.endswith('drop'))
     inet = lines.index(f'ip saddr {vip} oifname "ens3" accept')
@@ -99,25 +99,27 @@ def test_firewall_full_user_gets_internet_snat_but_private_ranges_stay_restricte
         assert private in lines[deny]
     assert f'ip saddr {vip} oifname "ens3" snat to 203.0.113.10' in lines
     # split users unchanged: no internet accept, no ens3 snat
-    for split_vip in ['10.250.0.4', '10.250.0.10']:
+    for split_vip in ['172.31.201.4', '172.31.201.10']:
         assert f'ip saddr {split_vip} ip daddr 10.10.7.0/24 accept' in lines
         assert not any(l.startswith(f'ip saddr {split_vip}') and ('ens3' in l or 'drop' in l) for l in lines)
-    assert 'ip saddr 10.250.0.0/24 ip daddr 10.10.7.0/24 oifname "ens8" snat to 10.10.7.14' in lines
+    assert 'ip saddr 172.31.201.0/24 ip daddr 10.10.7.0/24 oifname "ens8" snat to 10.10.7.14' in lines
     assert 'flush' not in rules
     assert any('maxseg' in l and vip in l for l in lines)
-    assert not any('maxseg' in l and '10.250.0.4' in l for l in lines)
+    assert any('maxseg' in l and '172.31.201.4' in l for l in lines)
 
 
 def test_firewall_split_only_output_is_unchanged():
     from vpn import firewall
     users = [dict(u, traffic_mode='split') for u in USERS[:2]]
-    expected = ('table inet vpnaas {\nchain users {\nip saddr 10.250.0.4 ip daddr 10.10.7.0/24 accept\n'
-                'ip saddr 10.250.0.10 ip daddr 10.10.7.0/24 accept\ndrop\n}\n'
+    expected = ('table inet vpnaas {\nchain users {\nip saddr 172.31.201.4 ip daddr 10.10.7.0/24 accept\n'
+                'ip saddr 172.31.201.10 ip daddr 10.10.7.0/24 accept\ndrop\n}\n'
                 'chain forward { type filter hook forward priority 0; policy drop;\nct state established,related accept\n'
-                'ip saddr 10.250.0.0/24 meta ipsec exists jump users\nip saddr 10.250.0.0/24 drop\n}\n'
+                'ip saddr 172.31.201.0/24 meta ipsec exists jump users\nip saddr 172.31.201.0/24 drop\n}\n'
                 'chain nat { type nat hook postrouting priority srcnat; policy accept;\n'
-                'ip saddr 10.250.0.0/24 ip daddr 10.10.7.0/24 oifname "ens8" snat to 10.10.7.14\n}\n}\n')
-    assert firewall([], users, []) == expected
+                'ip saddr 172.31.201.0/24 ip daddr 10.10.7.0/24 oifname "ens8" snat to 10.10.7.14\n}\n}\n')
+    text=firewall([], users, [])
+    before,rest=text.split('chain mss {',1)
+    assert before+'chain forward {'+rest.split('chain forward {',1)[1] == expected
 
 
 def test_migration_sets_split_on_legacy_rows(tmp_path):
@@ -141,4 +143,4 @@ def test_full_users_cannot_grant_other_vips_even_with_broad_allowed_cidr():
     from vpn import firewall
     u=dict(USERS[2],allowed_cidrs=['10.0.0.0/8'])
     lines=firewall([],[u],[]).splitlines()
-    assert lines.index('ip saddr 10.250.0.21 ip daddr 10.250.0.0/24 drop') < lines.index('ip saddr 10.250.0.21 ip daddr 10.0.0.0/8 accept')
+    assert lines.index('ip saddr 172.31.201.21 ip daddr 172.31.201.0/24 drop') < lines.index('ip saddr 172.31.201.21 ip daddr 10.0.0.0/8 accept')

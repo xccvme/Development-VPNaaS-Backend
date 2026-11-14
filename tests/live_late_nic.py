@@ -14,7 +14,7 @@ def wait(predicate):
 u=None
 try:
     u=api('users',dict(username='late-nic-test',password=secrets.token_hex(18),allowed_cidrs=['10.44.0.0/24']),'POST')
-    v='10.250.0.'+str(u['id']+1)
+    v=u['virtual_ip']
     assert f'ip saddr {v} ip daddr 10.44.0.0/24 drop' in rules()
     assert not api('status')['network']['private_ready']
     print('PASS missing LAN blocks grant; API provisioning works; diagnostic not ready')
