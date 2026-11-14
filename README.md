@@ -27,6 +27,7 @@ Buka **UDP 500/4500** pada firewall platform. API tetap di **`127.0.0.1:8000`**,
 - [Panduan REST API lengkap: operasi service, autentikasi, endpoint, dan contoh curl](dokumentasi/rest-api.md)
 - [NIC privat dipasang belakangan](dokumentasi/jaringan.md)
 - [Panduan Windows](dokumentasi/windows.md)
+- [Site-to-site (LAN ke LAN): subnet, routing, OpenStack, NAT-T](dokumentasi/site-to-site.md)
 - [Pool VIP acak per server dan migrasi](dokumentasi/pool-vip.md)
 - [Tuning kernel, jaringan, MTU/MSS dan rollback](dokumentasi/tuning-kernel-network.md)
 

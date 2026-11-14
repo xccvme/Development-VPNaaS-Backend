@@ -137,6 +137,11 @@ def render(connections,users):
     lines.append('}')
     return '\n'.join(lines)+'\n'
 
+def ts_pairs(connection):
+    """Every (local, remote) CIDR pair of an S2S connection; legacy rows hold one CIDR each."""
+    from store import ts_split
+    return [(l,r) for l in ts_split(connection['local_ts']) for r in ts_split(connection['remote_ts'])]
+
 def firewall(connections,users,policies):
     from pool import network
     pool=str(network())
@@ -159,16 +164,18 @@ def firewall(connections,users,policies):
           lines.append(f'ip daddr {v} rt ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
     for c in connections:
         if not c['enabled']:continue
-        for source,dest,match in ((c['remote_ts'],c['local_ts'],'meta'),(c['local_ts'],c['remote_ts'],'rt')):
+        for local,remote in ts_pairs(c):
+          for source,dest,match in ((remote,local,'meta'),(local,remote,'rt')):
             lines.append(f'ip saddr {source} ip daddr {dest} {match} ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
     lines+=['}', 'chain forward { type filter hook forward priority 0; policy drop;']
     lines+=['ct state established,related accept',
             f'ip saddr {pool} meta ipsec exists jump users',
             f'ip saddr {pool} drop']
     for c in connections:
-        if c['enabled']:
-            lines.append(f'ip saddr {c["remote_ts"]} ip daddr {c["local_ts"]} meta ipsec exists accept')
-            lines.append(f'ip saddr {c["local_ts"]} ip daddr {c["remote_ts"]} accept')
+        if not c['enabled']:continue
+        for local,remote in ts_pairs(c):
+            lines.append(f'ip saddr {remote} ip daddr {local} meta ipsec exists accept')
+            lines.append(f'ip saddr {local} ip daddr {remote} accept')
     for p in policies:
         if p['enabled']:
             proto='' if p['protocol']=='all' else 'ip protocol '+p['protocol']+' '

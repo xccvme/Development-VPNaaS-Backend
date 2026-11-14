@@ -218,12 +218,12 @@ Respons profil JSON memuat `username`, **`password` plaintext**, `traffic_mode`,
 | `name` | string regex aman sama seperti username; unik pada connections | Wajib |
 | `remote_address` | string alamat IPv4 peer; bukan hostname/URL | Wajib |
 | `remote_id` | string regex aman sama seperti username | Alamat `remote_address` bila kosong/tidak diberikan |
-| `local_ts` | string CIDR IPv4, dinormalisasi | `VPNAAS_LAN_CIDR` |
-| `remote_ts` | string CIDR IPv4, dinormalisasi | Wajib |
+| `local_ts` | string berisi 1–8 CIDR IPv4 dipisah koma (mis. `10.1.0.0/24,10.3.0.0/24`); dinormalisasi, duplikat dibuang, disimpan/dikembalikan sebagai `a,b` tanpa spasi | `VPNAAS_LAN_CIDR` |
+| `remote_ts` | string berisi 1–8 CIDR IPv4 dipisah koma, aturan sama dengan `local_ts` | Wajib |
 | `psk` | string regex credential sama seperti password | Wajib; omit/kosong PUT mempertahankan PSK |
 | `enabled` | boolean | `true` |
 
-`remote_id` harus sesuai identitas peer, dan selector di peer harus saling berbalik. `/0` tidak dilarang validator selector koneksi, tetapi jangan memberi selector luas tanpa desain routing/firewall yang tepat. Tidak ada field port, proposal, versi IKE, DNS, atau username pada koneksi; parameter kriptografi ditetapkan backend. Create hanya memuat konfigurasi (`start_action=none`), bukan otomatis membangun tunnel.
+`remote_id` harus sesuai identitas peer, dan selector di peer harus saling berbalik (`local_ts` di sini = `remote_ts` di peer). Validator menolak dengan 422: elemen kosong (mis. `"10.1.0.0/24,"`), bukan CIDR IPv4, lebih dari 8 CIDR, `/0`, subnet lokal yang overlap dengan subnet remote, dan subnet mana pun yang overlap dengan pool VIP C2S. Bit host dinormalisasi (`10.1.0.5/24` menjadi `10.1.0.0/24`). Data lama berisi satu CIDR tetap berlaku tanpa migrasi. Firewall membuka forward dan MSS clamp untuk setiap pasangan lokal×remote. Panduan desain routing, NAT-T dan OpenStack: [Site-to-site](site-to-site.md). Tidak ada field port, proposal, versi IKE, DNS, atau username pada koneksi; parameter kriptografi ditetapkan backend. Create hanya memuat konfigurasi (`start_action=none`), bukan otomatis membangun tunnel.
 
 ```bash
 curl --fail --silent --show-error -X GET \
@@ -237,7 +237,7 @@ CONNECTION_ID=$(printf '%s' "$CONNECTION_JSON" | python3 -c 'import json,sys; pr
 
 curl --fail --silent --show-error -X PUT \
   -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-  --data-binary '{"remote_ts":"10.30.1.0/24"}' \
+  --data-binary '{"remote_ts":"10.30.0.0/24,10.30.1.0/24"}' \
   "$API_BASE/api/connections/$CONNECTION_ID"
 
 # Tanpa body. Jalankan initiate hanya setelah peer nyata siap.

@@ -136,7 +136,7 @@ if __name__=='__main__':
         for kind,body in conn.execute('SELECT kind,body FROM objects'):
             u=json.loads(body)
             occupied.extend(u.get('allowed_cidrs',[]))
-            occupied.extend(u[k] for k in ('local_ts','remote_ts','source_cidr','destination_cidr') if k in u)
+            occupied.extend(x.strip() for k in ('local_ts','remote_ts','source_cidr','destination_cidr') if k in u for x in str(u[k]).split(',') if x.strip())
             if u.get('virtual_ip'):occupied.append(u['virtual_ip']+'/32')
         conn.close()
     print('Server VIP pool: '+ensure(path,occupied))

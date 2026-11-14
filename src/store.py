@@ -79,6 +79,29 @@ def safe(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_@.:-]{1,128}',value):raise ValueError()
     return value
 def cidr(value):return str(ipaddress.IPv4Network(value,strict=False))
+MAX_TS=8
+def ts_list(value):
+    """S2S selector: comma-separated 1..MAX_TS IPv4 CIDRs, normalized, deduped, no /0."""
+    if not isinstance(value,str):raise ValueError()
+    result=[]
+    for part in value.split(','):
+        net=cidr(part.strip())
+        if net.endswith('/0'):raise ValueError()
+        if net not in result:result.append(net)
+    if not 0<len(result)<=MAX_TS:raise ValueError()
+    return result
+def ts_split(value):
+    """Persisted selector string (single legacy CIDR or comma list) -> list."""
+    return [x.strip() for x in str(value).split(',') if x.strip()]
+def check_selectors(local,remote):
+    nets=lambda xs:[ipaddress.IPv4Network(x) for x in xs]
+    if any(a.overlaps(b) for a in nets(local) for b in nets(remote)):
+        raise HTTPException(422,'local_ts dan remote_ts tidak boleh overlap')
+    from pool import network as pool_network
+    try:pool=pool_network()
+    except Exception:pool=None
+    if pool and any(n.overlaps(pool) for n in nets(local+remote)):
+        raise HTTPException(422,'local_ts/remote_ts tidak boleh overlap dengan pool VIP C2S')
 def credential(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_@.!+,:/=-]{8,128}',value):raise ValueError()
     return value
@@ -102,7 +125,8 @@ def validate(kind,body,old=None):
         if kind=='connections':
             data['name']=safe(data['name']);data['remote_address']=str(ipaddress.IPv4Address(data['remote_address']))
             data['remote_id']=safe(data.get('remote_id') or data['remote_address'])
-            data['local_ts']=cidr(data.get('local_ts',os.environ.get('VPNAAS_LAN_CIDR','10.10.7.0/24')));data['remote_ts']=cidr(data['remote_ts']);data['psk']=credential(data['psk'])
+            local=ts_list(data.get('local_ts',os.environ.get('VPNAAS_LAN_CIDR','10.10.7.0/24')));remote=ts_list(data['remote_ts'])
+            data['local_ts']=','.join(local);data['remote_ts']=','.join(remote);data['psk']=credential(data['psk'])
         elif kind=='users':
             data['username']=safe(data['username']);data['password']=credential(data['password'])
             if 'allowed_cidrs' not in data:data['allowed_cidrs']=default_lan_cidrs()
@@ -125,6 +149,7 @@ def validate(kind,body,old=None):
             data.setdefault('protocol','all')
             if data['protocol'] not in ('all','tcp','udp','icmp'):raise ValueError()
     except (KeyError,ValueError,TypeError):raise HTTPException(422,'Invalid fields; credentials must be 8-128 safe printable characters')
+    if kind=='connections':check_selectors(local,remote)
     unique='username' if kind=='users' else 'name'
     if any(x[unique]==data[unique] and x['id']!=old.get('id') for x in rows(kind)):raise HTTPException(409,'Name already exists')
     return data
