@@ -1,4 +1,46 @@
-# Site-to-site (LAN ke LAN)
+# VPN Hub dan site-to-site (LAN ke LAN)
+
+## VPN Hub: Site A ↔ hub publik ↔ Site B
+
+Model `topology:hub` membentuk dua tunnel IKEv2 PSK terpisah. Hub meneruskan trafik A↔B; LAN hub tidak otomatis menjadi salah satu site. Model direct di bagian bawah tetap didukung tanpa menghapus koneksi/akun lama. Kontrak lengkap ada di [REST API](rest-api.md#4-connections-s2s-psk).
+
+Isi nama hub, `site_a.subnets` dan `site_b.subnets` (masing-masing 1–8 CIDR IPv4 koma, tanpa /0, tidak overlap antar site atau pool VIP). Set alamat `%any` untuk site dinamis/NAT; IPv4/hostname untuk site yang dapat menerima IKE. ID dan PSK unik per site dibuat otomatis bila tidak diisi. `nat:true` default adalah masquerade LAN, bukan pengaturan NAT-T.
+
+### Configure pada masing-masing site
+
+Unduh Configure Site A/B melalui UI atau `GET /api/connections/{id}/sites/a/config?format=script` (B serupa). File mengandung PSK: transfer melalui SSH, mode 600, jangan dicetak/log/commit. Jalankan **di spoke yang tepat**, bukan kedua file pada hub.
+
+```bash
+chmod 600 Setup-Hub-kantor-Site-A.sh
+bash -n Setup-Hub-kantor-Site-A.sh
+sudo bash Setup-Hub-kantor-Site-A.sh
+# Di site B jalankan file Site-B.
+# Hapus hanya instalasi spoke ini bila diperlukan:
+# sudo bash Setup-Hub-kantor-Site-A.sh --uninstall
+```
+
+Script Debian/Ubuntu root memasang paket yang belum tersedia, mengaktifkan forwarding IPv4, menulis konfigurasi mode600 `/etc/swanctl/conf.d/vpnaas-hub-<id>-a.conf`, tabel `inet vpnaas_spoke_<id>`, serta unit firewall `vpnaas-spoke-<id>-a.service` (B serupa). Konfigurasi/tabel lain tidak di-flush. Re-run idempoten; perubahan konfigurasi reconnect SA sendiri saja. Uninstall menghapus file/unit/tabel sendiri dan tidak mematikan forwarding global. Starter ipsec.conf aktif ditolak; gunakan charon-systemd/swanctl dan pastikan include conf.d/*.conf tersedia. Dua spoke hub yang sama harus berada pada mesin berbeda karena tabel nft memakai ID hub saja.
+
+Setelah mengubah subnet/ID/PSK/NAT, unduh ulang dan jalankan Configure terbaru pada spoke terkait; hub tidak mengubah mesin spoke secara remote. NAT script mengikuti route/interface saat dijalankan, bukan reconciler dinamis: ulangi bila jalur/interface LAN berubah. `format=swanctl` hanya mengekspor konfigurasi IPsec, bukan forwarding/firewall/NAT.
+
+### NAT tidak menggantikan route outbound
+
+Dengan NAT aktif di A, trafik dari B ke host LAN A dimasquerade ke IP interface LAN spoke A. Host tujuan dapat membalas tanpa route khusus ke subnet B, tetapi log/ACL tujuan melihat **IP spoke A, bukan IP asli host B**. Hal sebaliknya berlaku untuk NAT di B.
+
+**Host LAN yang memulai koneksi tetap memerlukan route ke subnet lawan via IP LAN spoke**, baik melalui default gateway spoke, static route di router LAN (disarankan), maupun route per host. Contoh A: `ip route add 10.2.0.0/24 via 10.1.0.1`; B: `ip route add 10.1.0.0/24 via 10.2.0.1`. Tanpa NAT, route dua arah juga diperlukan untuk balasan dan sumber asli dipertahankan. Spoke harus benar-benar dapat merutekan semua subnet lokalnya.
+
+### Firewall, status dan auto-reconnect
+
+Hub harus menerima UDP500/4500. Configure memakai `encap=yes` (ESP selalu UDP4500, terlihat TUNNEL-in-UDP), IKE AES256/SHA256/MODP2048 dan ESP AES256/SHA256; tidak perlu melemahkan crypto. Spoke NAT memulai koneksi. Connect hub ke `%any` ditolak 409; IP NAT statis pun tidak bisa diinisiasi dari hub tanpa port forwarding.
+
+Spoke memakai `start_action=start`, `dpd_action=restart`, `close_action=start` dan retry tanpa batas. **Disconnect sementara** bisa langsung disusul reconnect otomatis. Untuk disable administratif ubah `enabled:false` di hub dan hentikan konfigurasi spoke bila diperlukan. GET list/detail mengembalikan nested site status active/down, remote_host, bytes_in/out. Active memerlukan ESTABLISHED + INSTALLED, bukan bukti LAN. Telemetry gagal saat ini juga menghasilkan down, sehingga cek journal. Legacy direct tidak memiliki nested runtime site.
+
+Hub membuka transit A↔B dan clamp MSS maksimal1300; spoke punya tabel sendiri dan NAT opsional. **Accept di satu tabel nft tidak mengalahkan drop di tabel lain.** Backend lama/firewall lain pada spoke dengan policy drop harus diberi izin semua pasangan subnet dua arah lewat pemilik firewall itu. Script hanya memperingatkan, tidak mengubah firewall asing; jangan flush ruleset. OpenStack tanpa NAT memerlukan allowed-address-pairs subnet lawan pada port LAN dan security group sesuai. NAT ke IP NIC setempat membantu return path, bukan route outbound host.
+
+Verifikasi kedua leg dengan `swanctl --list-sas`, counter sebelum/sesudah, ping dan TCP kedua arah. Ping bersumber IP LAN **dari gateway** membuktikan tunnel dan akses host tujuan, bukan bahwa host LAN arbitrer sudah memiliki route outbound. Bukti LAN-host penuh perlu host nyata atau netns+veth di belakang masing-masing spoke dengan route via spoke; jangan mengubah tunnel produksi hanya untuk simulasi. Tidak ada bukti uji deployment spesifik yang disimpan dalam Git.
+
+## Legacy direct: gateway backend ini ↔ peer
+
 
 Koneksi site-to-site (S2S) menghubungkan dua jaringan kantor/data center lewat tunnel IPsec IKEv2 dengan PSK. Host di LAN site A bisa berbicara langsung dengan host di LAN site B memakai IP privat masing-masing, tanpa klien VPN di host tersebut. Gateway VPNaaS hanya meneruskan paket; host LAN tetap harus tahu bahwa subnet seberang dicapai lewat gateway.
 
@@ -28,7 +70,7 @@ Membuat koneksi di site A:
 
 ```bash
 curl --fail --silent --show-error -X POST \
-  -H "X-API-Key: ***" -H 'Content-Type: application/json' \
+  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
   --data-binary '{"name":"ke-site-b","remote_address":"198.51.100.20","remote_id":"198.51.100.20","local_ts":"10.1.0.0/24","remote_ts":"10.2.0.0/24","psk":"Ganti-Dengan-PSK-Acak-Unik-32","enabled":true}' \
   "$API_BASE/api/connections"
 ```
@@ -83,7 +125,7 @@ route -p add 10.2.0.0 mask 255.255.255.0 10.1.0.1
 
 OpenStack router (router subnet LAN, bukan gateway VPN):
 ```bash
-openstack router set --route destination=10.2.0.0/24,gateway=10.1.0.1 <ROUTER_LAN>
+openstack router set --route destination=10.2.0.0/24,gateway=10.1.0.1 "$ROUTER_LAN"
 ```
 
 Lakukan hal yang sama di site B untuk 10.1.0.0/24 via 10.2.0.1. Route harus dua arah; jika hanya satu sisi, ping akan timeout karena balasan tidak kembali ke tunnel.
@@ -96,16 +138,16 @@ Izinkan subnet remote pada port LAN gateway VPN:
 
 ```bash
 # Cari port NIC LAN gateway VPN
-openstack port list --server <NAMA_VM_GATEWAY>
+openstack port list --server "$NAMA_VM_GATEWAY"
 # Izinkan subnet seberang (ulangi untuk setiap CIDR remote_ts)
-openstack port set --allowed-address ip-address=10.2.0.0/24 <PORT_ID_LAN_GATEWAY>
-openstack port show <PORT_ID_LAN_GATEWAY> -c allowed_address_pairs
+openstack port set --allowed-address ip-address=10.2.0.0/24 "$PORT_ID_LAN_GATEWAY"
+openstack port show "$PORT_ID_LAN_GATEWAY" -c allowed_address_pairs
 ```
 
 Alternatif (kurang ketat): matikan port security pada port LAN saja, yang juga melepas security group port itu:
 
 ```bash
-openstack port set --no-security-group --disable-port-security <PORT_ID_LAN_GATEWAY>
+openstack port set --no-security-group --disable-port-security "$PORT_ID_LAN_GATEWAY"
 ```
 
 Jangan mematikan port security pada port publik. Security group port LAN juga harus mengizinkan trafik dari subnet remote ke host tujuan; demikian pula security group di VM tujuan (masuk dari 10.2.0.0/24).
@@ -155,7 +197,3 @@ Diagnosa umum:
 | Host tidak mengirim ke gateway sama sekali | Route di host/router LAN belum ada |
 | Hanya sebagian subnet yang lewat | Daftar `local_ts`/`remote_ts` tidak dicerminkan di kedua sisi |
 | HTTP/SSH macet tetapi ping lancar | MTU; periksa aturan MSS di chain `mss` dan firewall perantara |
-
-## Catatan uji
-
-Fitur multi-subnet diuji pada server uji dengan dua host LAN simulasi (network namespace + veth) di kedua sisi, satu sisi di balik NAT (inisiator) dan satu sisi publik: ping dan TCP (HTTP) berhasil dua arah antara host di belakang masing-masing gateway, CHILD SA memuat dua subnet per sisi, counter SA naik di kedua sisi, dan MSS SYN/SYN-ACK 1460 di-clamp menjadi 1300 oleh aturan backend. Uji ini tidak melibatkan OpenStack port security karena host simulasi berada di dalam VM gateway; untuk host LAN nyata, langkah allowed-address-pairs dan route di atas tetap diperlukan.

@@ -1,5 +1,5 @@
 """Only validated database fields reach generated configuration. No shell execution."""
-import os, subprocess, pathlib, tempfile
+import os, re, subprocess, pathlib, tempfile
 from fastapi import HTTPException
 from store import rows
 CONF=pathlib.Path('/etc/swanctl/conf.d/vpnaas.conf')
@@ -47,10 +47,49 @@ def session_vips(user):
 def pool_names(user):
     return [f"pool-{user['id']}"]+[f"pool-{user['id']}-{n}" for n in range(2,len(session_vips(user))+1)]
 
+def is_hub(connection):
+    return connection.get('topology')=='hub'
+
+def hub_children(c):
+    """{side letter: (conn name, child name, local_ts on hub, remote_ts on hub)}."""
+    a,b=c['site_a']['subnets'],c['site_b']['subnets']
+    i=c['id']
+    return {'a':(f'hub-{i}-a',f'hub-{i}-a-net',b,a),'b':(f'hub-{i}-b',f'hub-{i}-b-net',a,b)}
+
+def hub_blocks(c):
+    out=[]
+    for x,(conn,child,local_ts,remote_ts) in hub_children(c).items():
+        site=c['site_'+x]
+        out.append(f'''{conn} {{
+ version = 2
+ local_addrs = {PUBLIC_IP}
+ remote_addrs = {site['address']}
+ proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+ unique = replace
+ encap = yes
+ dpd_delay = 30s
+ local {{ auth = psk
+ id = {PUBLIC_IP}
+ }}
+ remote {{ auth = psk
+ id = {site['id']}
+ }}
+ children {{ {child} {{
+ local_ts = {local_ts}
+ remote_ts = {remote_ts}
+ esp_proposals = aes256-sha256,aes128-sha256
+ start_action = none
+ dpd_action = clear
+ }} }}
+}}''')
+    return out
+
 def render(connections,users):
     lines=['connections {']
     for c in connections:
         if not c['enabled']:continue
+        if is_hub(c):
+            lines.extend(hub_blocks(c));continue
         i=c['id']
         lines.append(f'''site-{i} {{
  version = 2
@@ -131,11 +170,22 @@ def render(connections,users):
             lines.append(f"{name} {{ addrs = {address}{dns}\n }}")
     lines.append('}\nsecrets {')
     for c in connections:
-        if c['enabled']:lines.append(f'ike-{c["id"]} {{ id-1 = {PUBLIC_IP}\n id-2 = {c["remote_id"]}\n secret = "{c["psk"]}"\n }}')
+        if not c['enabled']:continue
+        if is_hub(c):
+            for x in 'ab':
+                site=c['site_'+x]
+                lines.append(f'ike-hub-{c["id"]}-{x} {{ id-1 = {PUBLIC_IP}\n id-2 = {site["id"]}\n secret = "{site["psk"]}"\n }}')
+        else:lines.append(f'ike-{c["id"]} {{ id-1 = {PUBLIC_IP}\n id-2 = {c["remote_id"]}\n secret = "{c["psk"]}"\n }}')
     for u in users:
         if u['enabled']:lines.append(f'eap-{u["id"]} {{ id = {u["username"]}\n secret = "{u["password"]}"\n }}')
     lines.append('}')
     return '\n'.join(lines)+'\n'
+
+def hub_pairs(c):
+    """Every (source, destination) CIDR pair of hub transit, A->B then B->A."""
+    from store import ts_split
+    a,b=ts_split(c['site_a']['subnets']),ts_split(c['site_b']['subnets'])
+    return [(x,y) for x in a for y in b]+[(y,x) for x in a for y in b]
 
 def ts_pairs(connection):
     """Every (local, remote) CIDR pair of an S2S connection; legacy rows hold one CIDR each."""
@@ -164,6 +214,10 @@ def firewall(connections,users,policies):
           lines.append(f'ip daddr {v} rt ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
     for c in connections:
         if not c['enabled']:continue
+        if is_hub(c):
+            for source,dest in hub_pairs(c):
+                lines.append(f'ip saddr {source} ip daddr {dest} meta ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
+            continue
         for local,remote in ts_pairs(c):
           for source,dest,match in ((remote,local,'meta'),(local,remote,'rt')):
             lines.append(f'ip saddr {source} ip daddr {dest} {match} ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
@@ -173,6 +227,11 @@ def firewall(connections,users,policies):
             f'ip saddr {pool} drop']
     for c in connections:
         if not c['enabled']:continue
+        if is_hub(c):
+            # Transit A<->B: both legs are IPsec (decrypted in, re-encrypted out).
+            for source,dest in hub_pairs(c):
+                lines.append(f'ip saddr {source} ip daddr {dest} meta ipsec exists accept')
+            continue
         for local,remote in ts_pairs(c):
             lines.append(f'ip saddr {remote} ip daddr {local} meta ipsec exists accept')
             lines.append(f'ip saddr {local} ip daddr {remote} accept')
@@ -206,16 +265,15 @@ def vici_session():
     return vici.Session()
 
 
+OWNED=re.compile(r'(user|site)-\d+|hub-\d+-[ab]')
+
 def reload_config():
     # Replacing existing VICI entries preserves insertion order. Unload owned
     # configs (NOT SAs) so discovery is first even on an already-running daemon.
     session = vici_session()
     for name in session.get_conns().get('conns', []):
         label = name.decode() if isinstance(name, bytes) else name
-        if label == 'c2s-eap-discovery' or any(
-            label.startswith(prefix) and label[len(prefix):].isdigit()
-            for prefix in ('user-', 'site-')
-        ):
+        if label == 'c2s-eap-discovery' or OWNED.fullmatch(label):
             session.unload_conn({'name': name})
     run(['swanctl','--load-all','--clear'])
 
@@ -245,20 +303,41 @@ def _apply_locked():
         except Exception:pass
         raise HTTPException(502,'VPN configuration apply failed; previous configuration restored')
 
-def revoke(kind,ident):
+def revoke(kind,ident,row=None):
     if kind not in ('users','connections') or os.environ.get('VPNAAS_DRY_RUN')=='1':return
-    name=('user-' if kind=='users' else 'site-')+str(ident)
-    # swanctl returns nonzero when no matching SA exists; idempotent revocation.
-    result=subprocess.run(['swanctl','--terminate','--ike',name,'--timeout','5'],capture_output=True,text=True,timeout=8)
-    if result.returncode and 'no matching' not in (result.stdout+result.stderr).lower():
-        raise HTTPException(502,'Unable to revoke existing VPN session')
+    if kind=='connections' and row and is_hub(row):names=[f'hub-{ident}-a',f'hub-{ident}-b']
+    else:names=[('user-' if kind=='users' else 'site-')+str(ident)]
+    for name in names:
+        # Terminate by exact owned config name; other connections' SAs are untouched.
+        # swanctl returns nonzero when no matching SA exists; idempotent revocation.
+        result=subprocess.run(['swanctl','--terminate','--ike',name,'--timeout','5'],capture_output=True,text=True,timeout=8)
+        if result.returncode and 'no matching' not in (result.stdout+result.stderr).lower():
+            raise HTTPException(502,'Unable to revoke existing VPN session')
 
 def status():
     from pool import network
     return {'pool_cidr':str(network()),'raw':run(['swanctl','--list-sas']), 'connections':run(['swanctl','--list-conns']),
             'pools':run(['swanctl','--list-pools']), 'backend':'strongSwan swanctl'}
 
+NAT_SITE='Site di belakang NAT/IP dinamis: connect dari sisi site (jalankan script Configure)'
+
+def site_action(connection,side,operation):
+    if not is_hub(connection):raise HTTPException(409,'Bukan koneksi VPN Hub')
+    conn,child,_,_=hub_children(connection)[side]
+    if operation=='connect':
+        if not connection['enabled']:raise HTTPException(409,'Connection disabled')
+        if connection['site_'+side]['address']=='%any':raise HTTPException(409,NAT_SITE)
+        from runtime import hub_runtime
+        if hub_runtime([connection])[connection['id']]['site_'+side]['status']=='active':
+            return {'ok':True,'output':'already active'}
+        args=['swanctl','--initiate','--child',child,'--timeout','12']
+    else:args=['swanctl','--terminate','--ike',conn,'--timeout','12']
+    try:return {'ok':True,'output':run(args,timeout=18)}
+    except Exception:
+        raise HTTPException(502,'VPN action failed; inspect status and strongSwan journal')
+
 def action(connection,operation):
+    if is_hub(connection):raise HTTPException(409,'Koneksi VPN Hub: gunakan /sites/{a|b}/connect atau /disconnect')
     if operation=='initiate':
         if not connection['enabled']:raise HTTPException(409,'Connection disabled')
         args=['swanctl','--initiate','--child',f'net-{connection["id"]}','--timeout','12']

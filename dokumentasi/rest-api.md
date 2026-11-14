@@ -67,7 +67,7 @@ Pembacaan remote memerlukan izin sudo yang sesuai (atau sesi root yang diizinkan
 
 ## 2. Konvensi dan seluruh route
 
-Semua **20 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka huruf besar/kecil. Request POST/PUT CRUD memakai `Content-Type: application/json` dengan objek JSON, bukan array. Respons sukses bisnis selalu HTTP **200**, termasuk create dan delete (bukan 201/204).
+Semua **24 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka huruf besar/kecil. Request POST/PUT CRUD memakai `Content-Type: application/json` dengan objek JSON, bukan array. Respons sukses bisnis selalu HTTP **200**, termasuk create dan delete (bukan 201/204).
 
 | Metode | Path | Fungsi |
 |---|---|---|
@@ -82,17 +82,21 @@ Semua **20 operasi bisnis** di bawah memerlukan `X-API-Key`. Header tidak peka h
 | DELETE | `/api/users/{ident}` | Hapus akun |
 | GET | `/api/users/{ident}/profile` | Unduh profil sensitif |
 | GET | `/api/connections` | Seluruh koneksi S2S |
+| GET | `/api/connections/{ident}` | Detail koneksi dan runtime hub |
 | POST | `/api/connections` | Buat koneksi S2S |
 | PUT | `/api/connections/{ident}` | Ubah sebagian field koneksi |
 | DELETE | `/api/connections/{ident}` | Hapus koneksi |
 | POST | `/api/connections/{ident}/initiate` | Mulai CHILD S2S |
 | POST | `/api/connections/{ident}/terminate` | Hentikan IKE S2S |
+| GET | `/api/connections/{ident}/sites/{side}/config` | Configure sensitif |
+| POST | `/api/connections/{ident}/sites/{side}/connect` | Connect site hub |
+| POST | `/api/connections/{ident}/sites/{side}/disconnect` | Disconnect site hub |
 | GET | `/api/policies` | Seluruh policy global |
 | POST | `/api/policies` | Buat policy |
 | PUT | `/api/policies/{ident}` | Ubah sebagian field policy |
 | DELETE | `/api/policies/{ident}` | Hapus policy |
 
-`ident` adalah ID integer dari respons create/list. ID objek dipakai bersama lintas jenis resource, tidak dijamin berurutan dan **bukan** nomor host VIP. GET detail hanya tersedia untuk `/api/users/{ident}` (404 bila tidak ada); tidak ada GET detail `/api/connections/{ident}` atau `/api/policies/{ident}`, ambil list dan pilih berdasarkan `id`. Tidak ada PATCH, bulk CRUD, pencarian, pagination, total header, atau query filter. List berupa array langsung `[]`, diurutkan `id` naik, tanpa envelope `items/data`. Audit berbeda: urutan `id` turun, dibatasi 500, tanpa cursor/offset. Jangan mengandalkan query parameter yang tidak didukung untuk membatasi hasil.
+`ident` adalah ID integer dari respons create/list. ID objek dipakai bersama lintas jenis resource, tidak dijamin berurutan dan **bukan** nomor host VIP. GET detail tersedia untuk users dan connections (404 bila tidak ada); policies hanya list. Tidak ada PATCH, bulk CRUD, pencarian, pagination, total header, atau query filter. List berupa array langsung `[]`, diurutkan `id` naik, tanpa envelope `items/data`. Audit berbeda: urutan `id` turun, dibatasi 500, tanpa cursor/offset. Jangan mengandalkan query parameter yang tidak didukung untuk membatasi hasil.
 
 PUT bersifat **merge parsial**, bukan penggantian penuh: field yang tidak dikirim dipertahankan. Body `{}` juga diterima untuk objek yang ada dan tetap menjalankan apply/revocation. Field tak dikenal ditolak, termasuk `id`, `virtual_ip`, `extra_virtual_ips`, runtime, atau `dns` dalam request CRUD. `enabled` harus boolean JSON `true/false`, bukan string/angka.
 
@@ -191,7 +195,7 @@ strongSwan tidak membatasi jumlah sesi EAP per akun, jadi backend menegakkannya 
 
 Installer memilih satu `/24` bebas konflik dari rentang `172.31.201.0/24` sampai `172.31.250.0/24`, lalu menyimpannya sebagai `VPNAAS_POOL_CIDR`. Gunakan `pool_cidr` dari status untuk mengetahui pool server, jangan hardcode salah satu kandidat. VIP dialokasikan dari host bebas, disimpan per akun, dan tidak dihitung dari ID. Kapasitas 254 lease; tiap akun memakai `max_sessions` lease (default 3, jadi ±84 akun default; akun disabled tetap memegang lease). Edit/restart/reinstall mempertahankan VIP; menghapus akun membebaskan lease. Perubahan pool bukan CRUD biasa: perlu backup, migrasi, dan reconnect; lihat [pool VIP](pool-vip.md).
 
-### Profil akun: satu-satunya respons dengan password
+### Profil akun: respons sensitif dengan password
 
 Jalankan sebelum menghapus akun contoh. Profil juga bisa diambil untuk akun disabled; keberhasilan unduh tidak membuktikan akun boleh terkoneksi.
 
@@ -212,6 +216,10 @@ rm -f -- "$PROFILE_FILE"
 Respons profil JSON memuat `username`, **`password` plaintext**, `traffic_mode`, `server`, `server_id`, `virtual_ip`, `allowed_cidrs`, `ca_certificate`; full saja menambahkan `dns` array string IPv4. `server`/`server_id` memakai `VPNAAS_PUBLIC_IP` instalasi, bukan alamat loopback API. `ca_certificate` adalah PEM CA publik (string kosong bila file CA tidak ada), **bukan** private key. Tidak ada `id`, `enabled`, atau runtime di profil. Header: `Cache-Control: no-store` dan `Content-Disposition: attachment; filename="Profil-VPN-<username>.json"` bila diunduh lewat UI (API langsung: `user-<ident>.json`). No-store tidak mengenkripsi file di disk dan tidak mencegah logging oleh klien. API key maupun private CA/server key tidak dikembalikan.
 
 ## 4. Connections: S2S PSK
+
+### Legacy direct
+
+Field berikut untuk `topology:direct`. Respons juga menyertakan `topology:"direct"`.
 
 | Field body | Tipe / aturan | Default POST |
 |---|---|---|
@@ -253,6 +261,76 @@ curl --fail --silent --show-error -X DELETE \
 `192.0.2.10` adalah alamat dokumentasi; initiate contoh tidak akan berhasil tanpa menggantinya dengan peer yang dapat dijangkau dan mengonfigurasi kedua sisi. Respons list/create/update memiliki `id`, `name`, `remote_address`, `remote_id`, `local_ts`, `remote_ts`, `enabled`; **tidak memiliki `psk`**. Respons action adalah `{"ok":true,"output":"..."}` dengan output string swanctl. Initiate menjalankan CHILD `net-<ident>`; terminate menghentikan IKE `site-<ident>` tanpa menonaktifkan objek. Initiate pada koneksi disabled menghasilkan 409; terminate tanpa SA dapat menghasilkan 502, jangan mengasumsikannya idempoten.
 
 Action memakai timeout swanctl 12 detik dan subprocess 18 detik. HTTP 200 action bukan bukti trafik LAN end-to-end: periksa status IKE/CHILD, counter kedua peer, dan akses host di balik gateway. Tidak ada endpoint initiate/terminate akun C2S; klien memulai koneksi C2S. Edit/disable/delete akun atau koneksi mencabut SA terkait sebelum apply; **bahkan edit tanpa perubahan dapat memutus sesi**.
+
+### VPN Hub: Site A ↔ hub ↔ Site B
+
+POST/PUT `/api/connections` mendukung `topology:hub`. Hub membuat dua tunnel dan meneruskan trafik A↔B; LAN hub bukan otomatis salah satu site. Topology immutable setelah create. POST tanpa topology memilih direct bila mengandung field legacy, selain itu hub; baris lama tetap direct. Sebaiknya kirim topology eksplisit.
+
+| Field hub | Aturan/default |
+|---|---|
+| `name` | Wajib regex aman username 1–128; unik antar connections |
+| `topology` | `hub` atau `direct`; tidak bisa diubah PUT |
+| `enabled` | Boolean; default true |
+| `site_a`, `site_b` | Objek site dengan subnets wajib saat POST |
+
+| Field masing-masing site | Aturan/default |
+|---|---|
+| `name` | `[A-Za-z0-9 _.@:()-]{1,64}`; default Site A/B |
+| `address` | IPv4, hostname DNS valid (lowercase), `%any`; omit/kosong/null → `%any` |
+| `id` | Regex aman username; kosong/omit → `<slug-name>-a@vpnaas` / `-b@vpnaas`; unik antar site dan remote_id koneksi lain, berbeda dari ID publik hub |
+| `psk` | `[A-Za-z0-9_@.!+,:/=-]{16,128}`; omit POST → acak per site; omit/falsy PUT mempertahankan rahasia lama |
+| `subnets` | Wajib string 1–8 CIDR IPv4 koma; dinormalisasi/deduplikasi, tanpa /0, tanpa overlap A↔B maupun pool C2S |
+| `nat` | Boolean default true; Configure script masquerade trafik masuk ke LAN site ini; bukan NAT-T |
+
+PUT merge nested site: `{"site_a":{"nat":false}}` mempertahankan field lain. Field tidak dikenal (termasuk runtime/psk_set) ditolak. Edit merevoke kedua SA milik hub ini saja. Unduh dan jalankan ulang Configure pada spoke setelah mengubah subnet/PSK/ID/NAT; hub tidak mengonfigurasi spoke secara remote.
+
+GET list/detail dan POST/PUT hub memberi `id,name,topology,enabled,site_a,site_b`. Setiap site memberi `name,address,id,subnets,nat,psk_set` boolean (tanpa PSK), ditambah runtime `status` active/down, `remote_host` string IP[:port] atau null, `bytes_in`, `bytes_out` integer snapshot, bukan rate. Active memerlukan IKE ESTABLISHED dan CHILD INSTALLED pada `hub-<id>-a/b`. **Telemetry gagal/dry-run saat ini juga memberi down**, bukan Unknown; bukan bukti pasti peer terputus. Direct tidak mendapat nested runtime.
+
+```bash
+HUB_JSON=$(curl --fail --silent --show-error -X POST \
+  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  --data-binary '{"name":"kantor","topology":"hub","site_a":{"address":"198.51.100.20","subnets":"10.1.0.0/24"},"site_b":{"address":"%any","subnets":"10.2.0.0/24"}}' \
+  "$API_BASE/api/connections")
+HUB_ID=$(printf '%s' "$HUB_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl --fail --silent --show-error -H "X-API-Key: $API_KEY" "$API_BASE/api/connections/$HUB_ID"
+umask 077
+for SIDE in a b; do
+  curl --fail --silent --show-error -H "X-API-Key: $API_KEY" \
+    --output "Setup-Site-$SIDE.sh" \
+    "$API_BASE/api/connections/$HUB_ID/sites/$SIDE/config?format=script"
+  bash -n "Setup-Site-$SIDE.sh"
+done
+# Transfer each file through SSH to its matching site; run there as root.
+# sudo bash Setup-Site-a.sh
+curl --fail --silent --show-error -X POST -H "X-API-Key: $API_KEY" \
+  "$API_BASE/api/connections/$HUB_ID/sites/a/connect"
+curl --fail --silent --show-error -X POST -H "X-API-Key: $API_KEY" \
+  "$API_BASE/api/connections/$HUB_ID/sites/a/disconnect"
+```
+
+`side` only a/b; `format` swanctl (default) or script, otherwise 422 Invalid request. Download is text/plain UTF-8, `Cache-Control:no-store`, attachment `Hub-<name>-Site-A.conf` or `Setup-Hub-<name>-Site-A.sh` (B analogous, sanitized name). **Both contain that site's PSK**, available even when disabled. Protect mode 600, never print/commit. swanctl format only handles IPsec; script Debian/Ubuntu additionally handles forwarding/firewall/NAT.
+
+Action response `{"ok":true,"output":"..."}`. Connect active returns already active, except `%any` always gives 409 requiring initiation from spoke. Static NAT without forwarded UDP is also not reachable from hub. Timeout 12 seconds, subprocess 18. Disconnect is transient because spoke auto-reconnects (`close_action=start`, `dpd_action=restart`). Disable administratively with enabled:false and stop spoke config if needed. Disconnect currently maps all command failures to successful `no active session`; verify GET/journal afterward. Legacy initiate/terminate on hub returns 409. No C2S connect/disconnect endpoint.
+
+#### Additional hub errors
+
+All controlled errors use `{"detail":"..."}`. 404 Not found and 401 Unauthorized remain unchanged.
+
+| HTTP | detail / condition |
+|---|---|
+| 409 | `Bukan koneksi VPN Hub` on sites endpoints for direct |
+| 409 | `Connection disabled` on connect disabled |
+| 409 | `Site di belakang NAT/IP dinamis: connect dari sisi site (jalankan script Configure)` on connect to %any |
+| 409 | `Koneksi VPN Hub: gunakan /sites/{a\|b}/connect atau /disconnect` on legacy action for hub |
+| 422 | `topology tidak bisa diubah` / `topology harus hub atau direct` |
+| 422 | `enabled harus boolean` / `name wajib: 1-128 karakter A-Z a-z 0-9 _ @ . : -` |
+| 422 | site_a/site_b prefix: `.name tidak valid`, `.address harus IPv4, hostname, atau %any`, `.id tidak valid (A-Z a-z 0-9 _ @ . : -)`, `.psk minimal 16 karakter aman`, `.nat harus boolean`, `.subnets wajib`, `.subnets: 1-8 CIDR IPv4 dipisah koma, tanpa /0` |
+| 422 | `subnets site_a dan site_b tidak boleh overlap` / `subnets tidak boleh overlap dengan pool VIP C2S` |
+| 422 | `ID site harus unik di semua koneksi (dan berbeda dari ID hub)` / `remote_id sudah dipakai sebagai ID site VPN Hub` |
+| 422 | `Unknown fields` for unknown nested/top-level keys; `Invalid request` for invalid side/format |
+| 502 | `VPN action failed; inspect status and strongSwan journal` on failed connect |
+
+See [routing, Configure and NAT caveats](site-to-site.md). No API ports/proposals/crypto options.
 
 ## 5. Policies: izin forwarding global
 

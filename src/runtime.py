@@ -101,3 +101,38 @@ def user_runtime(users):
     except Exception:
         # Never label missing/invalid daemon telemetry as disconnected.
         return {user['id']: dict(unknown) for user in users}
+
+
+def hub_runtime(connections):
+    """Per hub site: 'active' only for ESTABLISHED IKE with an INSTALLED child of that conn."""
+    from vpn import run
+    import os
+    def down():
+        return {'status': 'down', 'remote_host': None, 'bytes_in': 0, 'bytes_out': 0}
+    result = {c['id']: {'site_a': down(), 'site_b': down()} for c in connections}
+    try:
+        if os.environ.get('VPNAAS_DRY_RUN') == '1':
+            raise ValueError('No runtime in dry-run')
+        sas = parse_sas(run(['swanctl', '--list-sas', '--raw'], timeout=8))
+    except Exception:
+        return result
+    for c in connections:
+        for side in ('a', 'b'):
+            name = f"hub-{c['id']}-{side}"
+            state = result[c['id']]['site_' + side]
+            for sa in sas:
+                if sa.get('name') != name:
+                    continue
+                children = [ch for ch in sa.get('child-sas', {}).values()
+                            if isinstance(ch, dict) and ch.get('state') == 'INSTALLED']
+                active = sa.get('state') == 'ESTABLISHED' and bool(children)
+                if state['status'] == 'active' and not active:
+                    continue
+                if sa.get('remote-host'):
+                    port = sa.get('remote-port')
+                    state['remote_host'] = sa['remote-host'] + (':' + port if port else '')
+                if active:
+                    state['status'] = 'active'
+                    state['bytes_in'] += sum(int(ch.get('bytes-in', 0)) for ch in children)
+                    state['bytes_out'] += sum(int(ch.get('bytes-out', 0)) for ch in children)
+    return result

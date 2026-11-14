@@ -1,4 +1,4 @@
-import sqlite3, os, json, re, ipaddress, threading
+import sqlite3, os, json, re, ipaddress, threading, secrets
 from fastapi import HTTPException
 lock=threading.RLock()
 db=sqlite3.connect(os.environ.get('VPNAAS_DB','/opt/vpnaas/data.sqlite3'),check_same_thread=False)
@@ -69,6 +69,12 @@ def get(kind,ident):
     raise HTTPException(404,'Not found')
 def public(row):
     result = {k:v for k,v in row.items() if k not in ('password','psk')}
+    if 'site_a' in row or 'remote_address' in row:
+        result['topology']=row.get('topology','direct')
+        for side in SITES:
+            if isinstance(row.get(side),dict):
+                site=row[side]
+                result[side]=dict({k:v for k,v in site.items() if k!='psk'},psk_set=bool(site.get('psk')))
     if 'username' in row:
         result['traffic_mode']=row.get('traffic_mode','split')
         result['max_sessions']=row.get('max_sessions',DEFAULT_MAX_SESSIONS)
@@ -106,8 +112,95 @@ def credential(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_@.!+,:/=-]{8,128}',value):raise ValueError()
     return value
 
+TOPOLOGIES=('hub','direct')
+SITES=('site_a','site_b')
+DIRECT_FIELDS={'name','remote_address','remote_id','local_ts','remote_ts','psk','enabled','topology'}
+HUB_FIELDS={'name','enabled','topology','site_a','site_b'}
+SITE_FIELDS={'name','address','id','psk','subnets','nat'}
+HOSTNAME=re.compile(r'(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*')
+SITE_NAME=re.compile(r'[A-Za-z0-9 _.@:()-]{1,64}')
+HUB_PSK=re.compile(r'[A-Za-z0-9_@.!+,:/=-]{16,128}')
+
+def topology_of(body,old):
+    """Existing rows keep their topology (rows without the key are legacy 'direct').
+    New rows: explicit value, else 'direct' when legacy fields are sent, else 'hub'."""
+    if old:
+        topology=old.get('topology','direct')
+        if 'topology' in body and body['topology']!=topology:raise HTTPException(422,'topology tidak bisa diubah')
+        return topology
+    if 'topology' in body:
+        if body['topology'] not in TOPOLOGIES:raise HTTPException(422,'topology harus hub atau direct')
+        return body['topology']
+    return 'direct' if set(body)&(DIRECT_FIELDS-HUB_FIELDS) else 'hub'
+
+def slug(value):
+    return re.sub(r'[^a-z0-9]+','-',str(value).lower()).strip('-') or 'hub'
+
+def site_address(value):
+    if value in (None,'','%any'):return '%any'
+    if not isinstance(value,str):raise ValueError()
+    try:return str(ipaddress.IPv4Address(value))
+    except ValueError:pass
+    if not HOSTNAME.fullmatch(value) or value.replace('.','').isdigit():raise ValueError()
+    return value.lower()
+
+def validate_hub(body,old):
+    if set(body)-HUB_FIELDS:raise HTTPException(422,'Unknown fields')
+    for side in SITES:
+        if side in body and (not isinstance(body[side],dict) or set(body[side])-SITE_FIELDS):raise HTTPException(422,'Unknown fields')
+    data={k:v for k,v in old.items() if k not in ('id',)+SITES}
+    data.update({k:v for k,v in body.items() if k not in SITES})
+    data['topology']='hub'
+    data.setdefault('enabled',True)
+    if type(data['enabled']) is not bool:raise HTTPException(422,'enabled harus boolean')
+    try:data['name']=safe(data.get('name'))
+    except ValueError:raise HTTPException(422,'name wajib: 1-128 karakter A-Z a-z 0-9 _ @ . : -')
+    subnets={}
+    for side,letter in zip(SITES,'ab'):
+        site=dict(old.get(side) or {})
+        site.update({k:v for k,v in (body.get(side) or {}).items() if not (k=='psk' and not v)})
+        label='site_'+letter
+        site.setdefault('name','Site '+letter.upper())
+        if not isinstance(site['name'],str) or not SITE_NAME.fullmatch(site['name']):raise HTTPException(422,f'{label}.name tidak valid')
+        try:site['address']=site_address(site.get('address'))
+        except ValueError:raise HTTPException(422,f'{label}.address harus IPv4, hostname, atau %any')
+        if not site.get('id'):site['id']=f"{slug(data['name'])}-{letter}@vpnaas"
+        try:site['id']=safe(site['id'])
+        except ValueError:raise HTTPException(422,f'{label}.id tidak valid (A-Z a-z 0-9 _ @ . : -)')
+        if 'psk' not in site:site['psk']=secrets.token_urlsafe(24)
+        if not isinstance(site['psk'],str) or not HUB_PSK.fullmatch(site['psk']):raise HTTPException(422,f'{label}.psk minimal 16 karakter aman')
+        site.setdefault('nat',True)
+        if type(site['nat']) is not bool:raise HTTPException(422,f'{label}.nat harus boolean')
+        if 'subnets' not in site:raise HTTPException(422,f'{label}.subnets wajib')
+        try:nets=ts_list(site['subnets'])
+        except (ValueError,TypeError):raise HTTPException(422,f'{label}.subnets: 1-{MAX_TS} CIDR IPv4 dipisah koma, tanpa /0')
+        site['subnets']=','.join(nets);subnets[side]=nets
+        data[side]=site
+    nets=lambda xs:[ipaddress.IPv4Network(x) for x in xs]
+    if any(a.overlaps(b) for a in nets(subnets['site_a']) for b in nets(subnets['site_b'])):
+        raise HTTPException(422,'subnets site_a dan site_b tidak boleh overlap')
+    from pool import network as pool_network
+    try:pool=pool_network()
+    except Exception:pool=None
+    if pool and any(n.overlaps(pool) for n in nets(subnets['site_a']+subnets['site_b'])):
+        raise HTTPException(422,'subnets tidak boleh overlap dengan pool VIP C2S')
+    if any(x['name']==data['name'] and x['id']!=old.get('id') for x in rows('connections')):raise HTTPException(409,'Name already exists')
+    ida,idb=data['site_a']['id'],data['site_b']['id']
+    taken=set()
+    for r in rows('connections'):
+        if r['id']==old.get('id'):continue
+        taken.add(r.get('remote_id'))
+        for side in SITES:taken.add((r.get(side) or {}).get('id'))
+    if ida==idb or {ida,idb}&taken or os.environ.get('VPNAAS_PUBLIC_IP','203.0.113.10') in (ida,idb):
+        raise HTTPException(422,'ID site harus unik di semua koneksi (dan berbeda dari ID hub)')
+    return data
+
 def validate(kind,body,old=None):
     old=old or {}
+    if kind=='connections':
+        if not isinstance(body,dict):raise HTTPException(422,'Invalid request')
+        if topology_of(body,old)=='hub':return validate_hub(body,old)
+        body={k:v for k,v in body.items() if k!='topology'}
     fields={'connections':{'name','remote_address','remote_id','local_ts','remote_ts','psk','enabled'},'users':{'username','password','enabled','allowed_cidrs','traffic_mode','max_sessions'},'policies':{'name','source_cidr','destination_cidr','protocol','enabled'}}[kind]
     if set(body)-fields:raise HTTPException(422,'Unknown fields')
     if kind=='users' and 'traffic_mode' in body and body['traffic_mode'] not in TRAFFIC_MODES:
@@ -126,6 +219,8 @@ def validate(kind,body,old=None):
             data['name']=safe(data['name']);data['remote_address']=str(ipaddress.IPv4Address(data['remote_address']))
             data['remote_id']=safe(data.get('remote_id') or data['remote_address'])
             local=ts_list(data.get('local_ts',os.environ.get('VPNAAS_LAN_CIDR','10.10.7.0/24')));remote=ts_list(data['remote_ts'])
+            hub_ids={(r.get(side) or {}).get('id') for r in rows('connections') if r['id']!=old.get('id') for side in SITES}
+            if data['remote_id'] in hub_ids:raise HTTPException(422,'remote_id sudah dipakai sebagai ID site VPN Hub')
             data['local_ts']=','.join(local);data['remote_ts']=','.join(remote);data['psk']=credential(data['psk'])
         elif kind=='users':
             data['username']=safe(data['username']);data['password']=credential(data['password'])
@@ -149,7 +244,9 @@ def validate(kind,body,old=None):
             data.setdefault('protocol','all')
             if data['protocol'] not in ('all','tcp','udp','icmp'):raise ValueError()
     except (KeyError,ValueError,TypeError):raise HTTPException(422,'Invalid fields; credentials must be 8-128 safe printable characters')
-    if kind=='connections':check_selectors(local,remote)
+    if kind=='connections':
+        check_selectors(local,remote)
+        if not old.get('id'):data['topology']='direct'
     unique='username' if kind=='users' else 'name'
     if any(x[unique]==data[unique] and x['id']!=old.get('id') for x in rows(kind)):raise HTTPException(409,'Name already exists')
     return data
