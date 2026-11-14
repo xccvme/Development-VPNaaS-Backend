@@ -1,6 +1,6 @@
 # Public NIC dulu, private NIC belakangan
 
-VM boleh dibuat hanya dengan public NIC. DHCP/QGA dikelola platform, bukan installer ini. Tanpa private NIC, default izin placeholder `192.0.2.0/24`; akun tetap bisa dibuat dengan allowed_cidrs subnet yang nantinya dipasang.
+VM boleh dibuat hanya dengan public NIC. DHCP/QGA dikelola platform, bukan installer ini. Tanpa private NIC, installer dapat menyimpan `192.0.2.0/24` sebagai penanda bahwa LAN belum tersedia, **bukan izin default akun yang siap dipakai**. Jika `allowed_cidrs` dihilangkan, API mencari subnet LAN privat aktual pada NIC nonpublik di luar pool VIP; jika tidak ada, API mengembalikan HTTP 422 dan meminta CIDR eksplisit. Akun tetap bisa dibuat dengan `allowed_cidrs` eksplisit untuk subnet yang nantinya dipasang; aksesnya belum siap sampai route privat tersedia.
 
 `VPNAAS_ROUTE_AUTO=1` aktif dari installer. Timer tiap5 detik membaca route IPv4 main kernel, memilih default interface untuk internet, dan mencari route spesifik yang mencakup seluruh CIDR izin lewat NIC nonpublik. Route default saja tidak dianggap akses LAN. Route blackhole, loopback, publik, atau route lebih spesifik yang tidak aman membuat grant ditolak konservatif.
 

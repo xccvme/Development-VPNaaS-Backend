@@ -310,7 +310,7 @@ curl --fail --silent --show-error -X POST -H "X-API-Key: $API_KEY" \
 
 `side` only a/b; `format` swanctl (default) or script, otherwise 422 Invalid request. Download is text/plain UTF-8, `Cache-Control:no-store`, attachment `Hub-<name>-Site-A.conf` or `Setup-Hub-<name>-Site-A.sh` (B analogous, sanitized name). **Both contain that site's PSK**, available even when disabled. Protect mode 600, never print/commit. swanctl format only handles IPsec; script Debian/Ubuntu additionally handles forwarding/firewall/NAT.
 
-Action response `{"ok":true,"output":"..."}`. Connect active returns already active, except `%any` always gives 409 requiring initiation from spoke. Static NAT without forwarded UDP is also not reachable from hub. Timeout 12 seconds, subprocess 18. Disconnect is transient because spoke auto-reconnects (`close_action=start`, `dpd_action=restart`). Disable administratively with enabled:false and stop spoke config if needed. Disconnect currently maps all command failures to successful `no active session`; verify GET/journal afterward. Legacy initiate/terminate on hub returns 409. No C2S connect/disconnect endpoint.
+Action response `{"ok":true,"output":"..."}`. Connect active returns already active, except `%any` always gives 409 requiring initiation from spoke. Static NAT without forwarded UDP is also not reachable from hub. Timeout 12 seconds, subprocess 18. Disconnect is transient because spoke auto-reconnects (`close_action=start`, `dpd_action=restart`). Disable administratively with enabled:false and stop spoke config if needed. Connect maupun Disconnect yang gagal/timeout mengembalikan HTTP 502, bukan sukses palsu. Periksa GET/journal setelah action untuk memastikan status runtime. Legacy initiate/terminate on hub returns 409. No C2S connect/disconnect endpoint.
 
 #### Additional hub errors
 
@@ -328,7 +328,7 @@ All controlled errors use `{"detail":"..."}`. 404 Not found and 401 Unauthorized
 | 422 | `subnets site_a dan site_b tidak boleh overlap` / `subnets tidak boleh overlap dengan pool VIP C2S` |
 | 422 | `ID site harus unik di semua koneksi (dan berbeda dari ID hub)` / `remote_id sudah dipakai sebagai ID site VPN Hub` |
 | 422 | `Unknown fields` for unknown nested/top-level keys; `Invalid request` for invalid side/format |
-| 502 | `VPN action failed; inspect status and strongSwan journal` on failed connect |
+| 502 | `VPN action failed; inspect status and strongSwan journal` on failed connect/disconnect |
 
 See [routing, Configure and NAT caveats](site-to-site.md). No API ports/proposals/crypto options.
 

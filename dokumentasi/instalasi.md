@@ -46,7 +46,7 @@ sudo env PUBLIC_IP='<IPv4-publik-aktual>' PUBLIC_IF='<interface-publik>' bash in
 
 Saat memakai sudo, letakkan assignment **setelah `sudo env`** agar diteruskan ke installer, bukan `PUBLIC_IP=... sudo bash install.sh` yang dapat dibuang oleh kebijakan sudo. Sebagai root, gunakan `env PUBLIC_IP='...' bash install.sh`.
 
-NIC privat boleh dipasang sesudah instalasi. Tanpa NIC privat, installer memakai placeholder izin `192.0.2.0/24`, bukan LAN siap pakai. Tentukan `allowed_cidrs` akun sesuai subnet tujuan; akses LAN ditolak sampai ada route privat yang sesuai. Setelah NIC mendapat IP/route dari platform, timer menyesuaikan firewall/NAT tanpa reinstall. Variabel LAN menentukan default form/API, bukan mengunci interface pada mode route-auto. Lihat [mekanisme NIC privat](jaringan.md).
+NIC privat boleh dipasang sesudah instalasi. Tanpa NIC privat, installer menyimpan penanda LAN `192.0.2.0/24`, bukan izin akun siap pakai. Jika `allowed_cidrs` tidak dikirim, API mencari LAN privat aktual; bila belum ada, create akun mengembalikan 422. Kirim CIDR eksplisit jika ingin menyiapkan akun sebelum NIC dipasang. Tentukan `allowed_cidrs` akun sesuai subnet tujuan; akses LAN ditolak sampai ada route privat yang sesuai. Setelah NIC mendapat IP/route dari platform, timer menyesuaikan firewall/NAT tanpa reinstall. Variabel LAN menentukan default form/API, bukan mengunci interface pada mode route-auto. Lihat [mekanisme NIC privat](jaringan.md).
 
 ## Firewall dan path penting
 
