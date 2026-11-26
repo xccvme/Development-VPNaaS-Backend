@@ -302,6 +302,8 @@ def _render_backend_env(net: dict, db_path: str, pool_cidr: str, extra: dict) ->
         f"VPNAAS_LAN_IP={net['LAN_IP']}",
         f"VPNAAS_FULL_DNS={net['FULL_DNS']}",
         f"VPNAAS_DB={db_path}",
+        f"VPNAAS_API_HOST={(extra.get('VPNAAS_API_HOST') or '0.0.0.0').strip()}",
+        f"VPNAAS_API_PORT={(extra.get('VPNAAS_API_PORT') or '8000').strip()}",
         'VPNAAS_ROUTE_AUTO=1',
         'VPNAAS_USE_VICI=1',
     ]
@@ -496,7 +498,7 @@ def bootstrap(
         actions.append(f'selected-pool:{pool_cidr}')
 
     extra = {}
-    for mk in ('VPNAAS_REGION', 'VPNAAS_TENANT_ID', 'VPNAAS_INSTANCE_ID',
+    for mk in ('VPNAAS_REGION', 'VPNAAS_TENANT_ID', 'VPNAAS_INSTANCE_ID', 'VPNAAS_API_HOST', 'VPNAAS_API_PORT',
                'VPNAAS_POOL_ALLOW_CUSTOM', 'VPNAAS_PUBLIC_DOCS', 'VPNAAS_SESSION_LIMIT', 'VPNAAS_PIN_NETWORK'):
         short = mk.replace('VPNAAS_', '')
         extra[mk] = boot_overrides.get(mk) or boot_overrides.get(short) or old_env.get(mk) or ''

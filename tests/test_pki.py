@@ -84,3 +84,33 @@ def test_pki_lifecycle_certs_pkcs12_crl_and_pubkey_render(tmp_path, monkeypatch)
         c.delete(f"/api/users/{u_pub['id']}")
         c.delete(f"/api/users/{u_tls['id']}")
         c.delete(f"/api/sites/{s_pub['id']}")
+
+
+def test_pki_no_expiration_certificate(tmp_path, monkeypatch):
+    """Issuing a certificate with no_expiration=True uses RFC 5280 9999-12-31 sentinel and valid PKCS#12."""
+    monkeypatch.setenv('VPNAAS_SWANCTL_DIR', str(tmp_path / 'swanctl'))
+    monkeypatch.setenv('VPNAAS_CA_KEY', str(tmp_path / 'ca-key.pem'))
+    c = client()
+
+    cert = c.post('/api/pki/certs', json={
+        'name': 'perm-site-cert',
+        'san': 'perm@vpnaas',
+        'target_type': 'site',
+        'no_expiration': True,
+    })
+    assert cert.status_code == 200, cert.text
+    data = cert.json()
+    assert data['no_expiration'] is True
+    assert data['not_after'] == '9999-12-31T23:59:59Z'
+    assert data['days_remaining'] is None
+    assert data['expired'] is False
+
+    # PKCS#12 & .crt bundle work cleanly with no-expiration cert
+    p12 = c.get(f"/api/pki/certs/{data['id']}/bundle?format=p12")
+    assert p12.status_code == 200
+    key, leaf, cas = pkcs12.load_key_and_certificates(p12.content, None)
+    assert key is not None and leaf.not_valid_after_utc.year == 9999 and len(cas) == 1
+
+    # Also supports validity_days=0 as no_expiration shorthand
+    cert2 = c.post('/api/pki/certs', json={'name': 'perm-user-cert', 'target_type': 'user', 'validity_days': 0})
+    assert cert2.status_code == 200 and cert2.json()['no_expiration'] is True

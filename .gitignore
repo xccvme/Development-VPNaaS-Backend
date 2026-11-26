@@ -1,8 +1,50 @@
+# Python & testing artifacts
 __pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
 .venv/
-*.log
-*.sqlite3*
+env/
+
+# Runtime state, databases & secrets
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+.env
 *.env
+!*.env.example
 .api-key
+api.key
+*.key
 *.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.crl
+*.ovpn
+*.conf.local
+secrets/
+backups/
+
+# OS, editors & temporary files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*.log
+*.tmp
+*.bak
+*.orig

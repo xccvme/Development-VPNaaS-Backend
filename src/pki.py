@@ -21,6 +21,9 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
+NO_EXPIRATION_UTC = datetime.datetime(9999, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
+
 def _now_utc():
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -138,7 +141,8 @@ def cert_metadata(pem_bytes: bytes) -> dict:
     now = _now_utc()
     not_before = cert.not_valid_before_utc
     not_after = cert.not_valid_after_utc
-    days_remaining = int((not_after - now).total_seconds() // 86400)
+    no_exp = not_after.year >= 9999
+    days_remaining = None if no_exp else int((not_after - now).total_seconds() // 86400)
     san_ips, san_dns, san_emails = [], [], []
     try:
         san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
@@ -155,8 +159,9 @@ def cert_metadata(pem_bytes: bytes) -> dict:
         'serial': format(cert.serial_number, 'x'),
         'not_before': not_before.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'not_after': not_after.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'no_expiration': no_exp,
         'days_remaining': days_remaining,
-        'expired': now >= not_after,
+        'expired': False if no_exp else (now >= not_after),
         'san_ips': san_ips,
         'san_dns': san_dns,
         'san_emails': san_emails,
@@ -261,13 +266,20 @@ def rotate_server_cert(public_ip: str = None, extra_sans=None, validity_days: in
     return {'rotated': True, **cert_metadata(cert_bytes)}
 
 
-def issue_leaf_cert(common_name: str, san: str, target_type: str = 'user', validity_days: int = 365):
-    """Issue a client or S2S site X.509 certificate signed by the gateway CA."""
-    if not isinstance(validity_days, int) or isinstance(validity_days, bool) or not 1 <= validity_days <= 1825:
-        raise HTTPException(422, 'validity_days must be an integer 1..1825')
+def issue_leaf_cert(common_name: str, san: str, target_type: str = 'user', validity_days: int = 365, no_expiration: bool = False):
+    """Issue a client or S2S site X.509 certificate signed by the gateway CA.
+
+    When no_expiration=True (or validity_days is None / 0), uses RFC 5280 §4.1.2.5
+    non-expiring sentinel 9999-12-31T23:59:59Z.
+    """
+    is_no_exp = bool(no_expiration) or validity_days in (None, 0)
+    if not is_no_exp:
+        if not isinstance(validity_days, int) or isinstance(validity_days, bool) or not 1 <= validity_days <= 3650:
+            raise HTTPException(422, 'validity_days must be an integer 1..3650 (or set no_expiration=true)')
     ca_key, ca_cert = ensure_ca()
     leaf_key = _gen_rsa_key(2048 if target_type == 'user' else 3072)
     now = _now_utc()
+    not_after = NO_EXPIRATION_UTC if is_no_exp else (now + datetime.timedelta(days=validity_days))
     ekus = [ExtendedKeyUsageOID.CLIENT_AUTH]
     if target_type == 'site':
         ekus.append(ExtendedKeyUsageOID.SERVER_AUTH)
@@ -278,7 +290,7 @@ def issue_leaf_cert(common_name: str, san: str, target_type: str = 'user', valid
         .public_key(leaf_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5))
-        .not_valid_after(now + datetime.timedelta(days=validity_days))
+        .not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(

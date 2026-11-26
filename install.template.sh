@@ -12,6 +12,8 @@ FULL_DNS="${FULL_DNS:-}"
 REGION="${REGION:-}"
 TENANT_ID="${TENANT_ID:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
+API_HOST="${API_HOST:-0.0.0.0}"
+API_PORT="${API_PORT:-8000}"
 IMAGE_MODE="${IMAGE_MODE:-0}"
 for arg in "$@"; do
     case "$arg" in
@@ -30,7 +32,7 @@ export TUNE_NET_IPV4_TCP_RMEM="${TUNE_NET_IPV4_TCP_RMEM:-4096 87380 16777216}"
 export TUNE_NET_IPV4_TCP_WMEM="${TUNE_NET_IPV4_TCP_WMEM:-4096 65536 16777216}"
 export TUNE_NET_NETFILTER_NF_CONNTRACK_MAX="${TUNE_NET_NETFILTER_NF_CONNTRACK_MAX:-262144}"
 export TUNE_FS_FILE_MAX="${TUNE_FS_FILE_MAX:-2097152}"
-export PUBLIC_IP PUBLIC_IF BIND_IP LAN_CIDR LAN_IF LAN_IP FULL_DNS REGION TENANT_ID INSTANCE_ID IMAGE_MODE
+export PUBLIC_IP PUBLIC_IF BIND_IP LAN_CIDR LAN_IF LAN_IP FULL_DNS REGION TENANT_ID INSTANCE_ID API_HOST API_PORT IMAGE_MODE
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 . /etc/os-release
 [[ $ID == debian && $VERSION_ID == 13 ]] || { echo 'Debian 13 required' >&2; exit 1; }
@@ -79,6 +81,11 @@ cat > /opt/vpnaas/backend/run <<'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
 export VPNAAS_API_KEY="$(</etc/vpnaas/api.key)"
+export VPNAAS_API_HOST="${VPNAAS_API_HOST:-0.0.0.0}"
+export VPNAAS_API_PORT="${VPNAAS_API_PORT:-8000}"
+if [[ "${1:-}" == "--serve" ]]; then
+    exec /opt/vpnaas/backend/venv/bin/uvicorn app:app --host "$VPNAAS_API_HOST" --port "$VPNAAS_API_PORT" --no-access-log
+fi
 exec "$@"
 RUN
 chmod 700 /opt/vpnaas/backend/run
@@ -106,7 +113,7 @@ WantedBy=multi-user.target
 BOOT
 cat > /etc/systemd/system/vpnaas-api.service <<'UNIT'
 [Unit]
-Description=VPNaaS backend (loopback)
+Description=VPNaaS backend REST API
 After=network-online.target vpnaas-bootstrap.service strongswan.service
 Wants=network-online.target vpnaas-bootstrap.service
 Requires=strongswan.service
@@ -116,7 +123,7 @@ User=root
 WorkingDirectory=/opt/vpnaas/backend
 EnvironmentFile=/etc/vpnaas/backend.env
 ExecStartPre=/opt/vpnaas/backend/run /opt/vpnaas/backend/venv/bin/python -c "from vpn import apply; apply()"
-ExecStart=/opt/vpnaas/backend/run /opt/vpnaas/backend/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --no-access-log
+ExecStart=/opt/vpnaas/backend/run --serve
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -200,9 +207,9 @@ for k in ('PUBLIC_IF','LAN_IF'):
     if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}',net[k]) or not Path('/sys/class/net',net[k]).exists():raise SystemExit('Invalid interface '+k)
 if not 1<=len(net['FULL_DNS'].split(','))<=4:raise SystemExit('Set 1-4 DNS servers')
 extra={}
-for mk in ('REGION','TENANT_ID','INSTANCE_ID'):
+for mk in ('REGION','TENANT_ID','INSTANCE_ID','API_HOST','API_PORT'):
     mv=os.environ.get(mk) or old.get('VPNAAS_'+mk) or ''
-    if mv and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',mv):
+    if mv and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}',mv):
         extra['VPNAAS_'+mk]=mv
 if not extra.get('VPNAAS_INSTANCE_ID'):
     cid=bootstrap.read_vm_identity().get('cloud_instance_id','')
@@ -255,12 +262,14 @@ systemctl enable vpnaas-api.service
 systemctl restart vpnaas-api.service
 python3 - <<'READY'
 from pathlib import Path
-import urllib.request, time
+import os, urllib.request, time
+host = os.environ.get('VPNAAS_API_HOST', '0.0.0.0')
+port = os.environ.get('VPNAAS_API_PORT', '8000')
 for _ in range(90):
     try:
-        r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/api/health',headers={'X-API-Key':Path('/etc/vpnaas/api.key').read_text().strip()}),timeout=2)
+        r=urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/api/health',headers={'X-API-Key':Path('/etc/vpnaas/api.key').read_text().strip()}),timeout=2)
         assert r.status==200
-        print('VPNaaS ready: http://127.0.0.1:8000; API key /etc/vpnaas/api.key (root-only)')
+        print(f'VPNaaS ready: http://{host}:{port}; API key /etc/vpnaas/api.key (batasi akses port {port} via Cloud Security Group)')
         break
     except Exception:time.sleep(1)
 else:raise SystemExit('Backend not ready. Inspect journalctl -u vpnaas-api')

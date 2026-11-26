@@ -901,7 +901,7 @@ def pki_certs_issue(body: dict):
     import pki
     from store import safe
 
-    if not isinstance(body, dict) or set(body) - {'name', 'san', 'target_type', 'validity_days'}:
+    if not isinstance(body, dict) or set(body) - {'name', 'san', 'target_type', 'validity_days', 'no_expiration'}:
         raise HTTPException(422, 'Unknown fields')
     try:
         name = safe(body.get('name'))
@@ -915,9 +915,14 @@ def pki_certs_issue(body: dict):
         san = safe(san)
     except ValueError:
         raise HTTPException(422, 'san tidak valid')
-    validity_days = body.get('validity_days', 365)
+    no_exp = body.get('no_expiration', False)
+    if type(no_exp) is not bool:
+        raise HTTPException(422, 'no_expiration harus boolean')
+    validity_days = None if no_exp else body.get('validity_days', 365)
 
-    cert_pem, key_pem, meta = pki.issue_leaf_cert(name, san, target_type=target_type, validity_days=validity_days)
+    cert_pem, key_pem, meta = pki.issue_leaf_cert(
+        name, san, target_type=target_type, validity_days=validity_days, no_expiration=no_exp
+    )
     record = {
         'name': name,
         'san': san,
