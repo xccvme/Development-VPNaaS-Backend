@@ -117,10 +117,13 @@ def ensure_public_routing(routes=None):
     pub_metric = int(best_pub.get('metric', 0))
 
     iface_ips = _interface_ipv4s(pub_if)
+    env_bind_ip = os.environ.get('VPNAAS_BIND_IP', '').strip()
     env_pub_ip = os.environ.get('VPNAAS_PUBLIC_IP', '').strip()
     pub_src = None
     if best_pub.get('prefsrc') and (not iface_ips or best_pub['prefsrc'] in iface_ips):
         pub_src = best_pub['prefsrc']
+    elif env_bind_ip and env_bind_ip in iface_ips:
+        pub_src = env_bind_ip
     elif env_pub_ip and env_pub_ip in iface_ips:
         pub_src = env_pub_ip
     elif iface_ips:
@@ -365,16 +368,26 @@ def route_firewall(text, users, connections=None, sites=None, groups=None, route
 
 
 def reconcile():
-    from vpn import firewall, run, atomic
-    from store import rows
+    from vpn import CONF, firewall, run, atomic, lan_cidr, render, reload_config
+    from store import LAN_PLACEHOLDER, rows
     from pathlib import Path
     with configuration_lock():
         try:
             ensure_public_routing()
         except Exception:
             pass
-        rules = firewall(rows('connections'), rows('users'), rows('policies'),
-                         sites=rows('sites'), groups=rows('groups'), routes=rows('routes'))
+        conns, users, pols = rows('connections'), rows('users'), rows('policies')
+        sites, groups, routes = rows('sites'), rows('groups'), rows('routes')
+        # If private NIC was hot-attached after boot (LAN_CIDR placeholder), keep swanctl.conf local_ts in sync too.
+        if lan_cidr() == LAN_PLACEHOLDER and (sites or users):
+            try:
+                rendered = render(conns, users, sites=sites, groups=groups, policies=pols, certs=rows('certs'), routes=routes)
+                if not CONF.exists() or CONF.read_text() != rendered:
+                    atomic(CONF, rendered)
+                    reload_config()
+            except Exception:
+                pass
+        rules = firewall(conns, users, pols, sites=sites, groups=groups, routes=routes)
         path = Path('/opt/vpnaas/firewall.nft')
         exists = subprocess.run(['nft', 'list', 'table', 'inet', 'vpnaas'], capture_output=True).returncode == 0
         if exists and path.exists() and path.read_text() == rules:

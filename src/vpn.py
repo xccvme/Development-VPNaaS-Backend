@@ -15,6 +15,7 @@ from store import (
     rows,
     site_effective_subnets,
     ts_split,
+    vpc_cidrs,
 )
 
 CONF = pathlib.Path('/etc/swanctl/conf.d/vpnaas.conf')
@@ -36,6 +37,11 @@ def public_if():
 
 def public_ip():
     return os.environ.get('VPNAAS_PUBLIC_IP', PUBLIC_IP)
+
+
+def bind_ip():
+    """Local socket IPv4 for strongSwan local_addrs (equals public_ip unless behind 1:1 NAT / Floating IP)."""
+    return os.environ.get('VPNAAS_BIND_IP') or public_ip()
 
 
 def lan_if():
@@ -105,12 +111,13 @@ def hub_children(c):
 
 def hub_blocks(c):
     pub = public_ip()
+    bind = bind_ip()
     out = []
     for x, (conn, child, local_ts, remote_ts) in hub_children(c).items():
         site = c['site_' + x]
         out.append(f'''{conn} {{
  version = 2
- local_addrs = {pub}
+ local_addrs = {bind}
  remote_addrs = {site['address']}
  proposals = {DEFAULT_IKE_PROPOSALS}
  unique = replace
@@ -192,12 +199,8 @@ def site_local_ts(site, sites=None, users=None, groups=None, policies=None, rout
             out.append(str(net))
 
     if site.get('allow_vpc', True):
-        lan = lan_cidr()
-        if lan and lan != LAN_PLACEHOLDER:
-            add(lan)
-        for r in routes:
-            if r.get('enabled', True) and r.get('site_id') is None and (r.get('gateway') or r.get('interface')):
-                add(r.get('destination_cidr'))
+        for c in vpc_cidrs(routes):
+            add(c)
 
     # Inter-site subnets ONLY when explicitly peered via peer_sites OR connected by an enabled allow policy (default deny).
     for other in sites:
@@ -212,7 +215,7 @@ def site_local_ts(site, sites=None, users=None, groups=None, policies=None, rout
     for u in users:
         if not u.get('enabled', True):
             continue
-        if site['id'] in effective_user_site_ids(u, groups):
+        if site['id'] in effective_user_site_ids(u, groups, sites):
             c2s_allowed = True
             break
         u_nets = [ipaddress.IPv4Network(c) for c in effective_user_cidrs(u, groups, sites, routes)]
@@ -236,6 +239,7 @@ def site_local_ts(site, sites=None, users=None, groups=None, policies=None, rout
 
 def _site_block(site, local_ts, certs_by_id, remote_ts=None):
     pub = public_ip()
+    bind = bind_ip()
     i = site['id']
     conn = f'site-n-{i}'
     child = f'site-n-{i}-net'
@@ -253,7 +257,7 @@ def _site_block(site, local_ts, certs_by_id, remote_ts=None):
         remote_auth = f' remote {{ auth = psk\n id = {site["ike_id"]}\n }}'
     return f'''{conn} {{
  version = 2
- local_addrs = {pub}
+ local_addrs = {bind}
  remote_addrs = {site['address']}
  proposals = {ike_p}
  unique = replace
@@ -272,6 +276,7 @@ def _site_block(site, local_ts, certs_by_id, remote_ts=None):
 
 def render(connections, users, sites=None, groups=None, policies=None, certs=None, routes=None):
     pub = public_ip()
+    bind = bind_ip()
     sites = sites or []
     groups = groups or []
     policies = policies or []
@@ -288,7 +293,7 @@ def render(connections, users, sites=None, groups=None, policies=None, certs=Non
         i = c['id']
         lines.append(f'''site-{i} {{
  version = 2
- local_addrs = {pub}
+ local_addrs = {bind}
  remote_addrs = {c['remote_address']}
  proposals = {DEFAULT_IKE_PROPOSALS}
  unique = replace
@@ -323,7 +328,7 @@ def render(connections, users, sites=None, groups=None, policies=None, certs=Non
     if enabled_eap:
         lines.append(f'''c2s-eap-discovery {{
  version = 2
- local_addrs = {pub}
+ local_addrs = {bind}
  remote_addrs = %any
  proposals = {DEFAULT_IKE_PROPOSALS}
  fragmentation = yes
@@ -344,7 +349,9 @@ def render(connections, users, sites=None, groups=None, policies=None, certs=Non
         if not u['enabled']:
             continue
         i = u['id']
-        eff_cidrs = effective_user_cidrs(u, groups, sites, routes) if (groups or sites or routes or u.get('groups') or u.get('allowed_sites')) else u['allowed_cidrs']
+        eff_cidrs = effective_user_cidrs(u, groups, sites, routes) if (
+            groups or sites or routes or u.get('groups') or u.get('allowed_sites') or u.get('allow_vpc') or u.get('allow_all_sites')
+        ) else u['allowed_cidrs']
         if not is_full(u) and not eff_cidrs:
             # Skip split-tunnel conn when all referenced sites/groups are currently disabled to avoid empty local_ts syntax error.
             continue
@@ -372,7 +379,7 @@ def render(connections, users, sites=None, groups=None, policies=None, certs=Non
  }}'''
         lines.append(f'''user-{i} {{
  version = 2
- local_addrs = {pub}
+ local_addrs = {bind}
  remote_addrs = %any
  proposals = {DEFAULT_IKE_PROPOSALS}
  pools = {','.join(pool_names(u))}
@@ -475,8 +482,7 @@ def _resolve_policy_endpoints(policy, users, groups, sites, routes=None):
         s = smap.get(policy.get('destination_ref'))
         dsts = site_effective_subnets(s, routes) if s else []
     elif dt == 'vpc':
-        lan = lan_cidr()
-        dsts = [lan] if lan and lan != LAN_PLACEHOLDER else []
+        dsts = vpc_cidrs(routes)
     else:
         dsts = []
 
@@ -488,7 +494,7 @@ def firewall(connections, users, policies, sites=None, groups=None, routes=None)
     from network import is_s2s_target, s2s_subnet_networks
     pool = str(network())
     pub_if = public_if()
-    pub_ip = public_ip()
+    pub_ip = bind_ip()
     l_if = lan_if()
     l_ip = lan_ip()
     l_cidr = lan_cidr()
@@ -536,7 +542,9 @@ def firewall(connections, users, policies, sites=None, groups=None, routes=None)
     for u in users:
         if not u['enabled']:
             continue
-        eff_cidrs = effective_user_cidrs(u, groups, sites, routes) if (groups or sites or routes or u.get('groups') or u.get('allowed_sites')) else u['allowed_cidrs']
+        eff_cidrs = effective_user_cidrs(u, groups, sites, routes) if (
+            groups or sites or routes or u.get('groups') or u.get('allowed_sites') or u.get('allow_vpc') or u.get('allow_all_sites')
+        ) else u['allowed_cidrs']
         for v in session_vips(u):
             if is_full(u):
                 lines.append(f'ip saddr {v} ip daddr {pool} drop')
@@ -572,12 +580,7 @@ def firewall(connections, users, policies, sites=None, groups=None, routes=None)
                 lines.append(f'ip saddr {source} ip daddr {dest} {match} ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > {FULL_MSS} tcp option maxseg size set {FULL_MSS}')
 
     # MSS clamping for Multi-Site S2S (Site <-> VPC + local static routes and peered/policy-connected Site <-> Site)
-    vpc_and_routes = []
-    if l_cidr and l_cidr != LAN_PLACEHOLDER:
-        vpc_and_routes.append(l_cidr)
-    for r in local_static_routes:
-        if r['destination_cidr'] not in vpc_and_routes:
-            vpc_and_routes.append(r['destination_cidr'])
+    vpc_and_routes = vpc_cidrs(routes)
 
     mss_seen = set()
     for s in sites:

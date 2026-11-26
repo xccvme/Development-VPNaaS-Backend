@@ -93,11 +93,26 @@ def _user_matches_sa(user, sa):
 
 
 def user_runtime(users, sas=None):
-    unknown = {'runtime_status': 'Unknown', 'session_count': None, 'virtual_ips': [], 'sessions': []}
+    from store import get_telemetry_map, record_telemetry_batch
+    telem = get_telemetry_map('users')
+
+    def unknown(uid):
+        t = telem.get(uid) or {}
+        return {
+            'runtime_status': 'Unknown',
+            'online': None,
+            'session_count': None,
+            'virtual_ips': [],
+            'sessions': [],
+            'last_connected_at': t.get('last_connected_at'),
+            'last_remote_host': t.get('last_remote_host'),
+        }
+
     try:
         if sas is None:
             sas = _read_sas()
         result = {}
+        active_updates = []
         for user in users:
             sessions = []
             for sa in sas:
@@ -121,17 +136,36 @@ def user_runtime(users, sas=None):
                     'virtual_ips': sa.get('remote-vips', []),
                     'children': children,
                 })
-            active = any(s['ike_state'] == 'ESTABLISHED' and s['children'] for s in sessions)
+            active_sessions = [s for s in sessions if s['ike_state'] == 'ESTABLISHED' and s['children']]
+            active = bool(active_sessions)
+            first_remote = None
+            if active_sessions:
+                raddr = active_sessions[0].get('remote_address')
+                rport = active_sessions[0].get('remote_port')
+                first_remote = f'{raddr}:{rport}' if (raddr and rport) else raddr
+                active_updates.append((user['id'], first_remote))
             result[user['id']] = {
                 'runtime_status': 'Active' if active else 'Down',
-                'session_count': sum(s['ike_state'] == 'ESTABLISHED' and bool(s['children']) for s in sessions),
+                'online': active,
+                'session_count': len(active_sessions),
                 'virtual_ips': sorted({ip for s in sessions for ip in s['virtual_ips']}),
                 'sessions': sessions,
+                'last_remote_host': first_remote,
             }
+        if active_updates:
+            try:
+                telem = record_telemetry_batch('users', active_updates)
+            except Exception:
+                pass
+        for uid, entry in result.items():
+            t = telem.get(uid) or {}
+            entry['last_connected_at'] = t.get('last_connected_at')
+            if not entry['last_remote_host']:
+                entry['last_remote_host'] = t.get('last_remote_host')
         return result
     except Exception:
         # Never label missing/invalid daemon telemetry as disconnected.
-        return {user['id']: dict(unknown) for user in users}
+        return {user['id']: unknown(user['id']) for user in users}
 
 
 def _sa_state_for_conn(sas, conn_name):
@@ -217,11 +251,19 @@ def direct_runtime(connections, sas=None):
 
 
 def site_runtime(sites, sas=None):
-    """Runtime telemetry for Multi-Site S2S peers (`site-n-<id>`)."""
-    def unknown():
+    """Runtime telemetry for Multi-Site S2S peers (`site-n-<id>`), including online state & persisted last_connected_at."""
+    from store import get_telemetry_map, record_telemetry_batch
+    telem = get_telemetry_map('sites')
+
+    def unknown(sid):
+        t = telem.get(sid) or {}
         return {
             'status': 'unknown',
+            'online': None,
+            'connection_state': 'unknown',
             'remote_host': None,
+            'last_remote_host': t.get('last_remote_host'),
+            'last_connected_at': t.get('last_connected_at'),
             'bytes_in': 0,
             'bytes_out': 0,
             'ike_sa_id': None,
@@ -232,9 +274,30 @@ def site_runtime(sites, sas=None):
         if sas is None:
             sas = _read_sas()
     except Exception:
-        return {s['id']: unknown() for s in sites}
+        return {s['id']: unknown(s['id']) for s in sites}
 
-    return {s['id']: _sa_state_for_conn(sas, f"site-n-{s['id']}") for s in sites}
+    states = {}
+    active_updates = []
+    for s in sites:
+        st = _sa_state_for_conn(sas, f"site-n-{s['id']}")
+        is_online = st['status'] == 'active'
+        st['online'] = is_online
+        st['connection_state'] = 'online' if is_online else 'offline'
+        if is_online:
+            active_updates.append((s['id'], st['remote_host']))
+        states[s['id']] = st
+
+    if active_updates:
+        try:
+            telem = record_telemetry_batch('sites', active_updates)
+        except Exception:
+            pass
+
+    for sid, st in states.items():
+        t = telem.get(sid) or {}
+        st['last_connected_at'] = t.get('last_connected_at')
+        st['last_remote_host'] = st['remote_host'] or t.get('last_remote_host')
+    return states
 
 
 def tunnels_summary(users, sites, connections):
@@ -257,6 +320,7 @@ def tunnels_summary(users, sites, connections):
     total_in = 0
     total_out = 0
     active_c2s_sessions = 0
+    c2s_users_online = 0
     for u in users:
         rt = u_rt[u['id']]
         u_in = sum(ch['bytes_in'] for s in rt['sessions'] for ch in s['children'])
@@ -265,12 +329,17 @@ def tunnels_summary(users, sites, connections):
         total_out += u_out
         if rt['session_count']:
             active_c2s_sessions += rt['session_count']
+        if rt.get('online'):
+            c2s_users_online += 1
         c2s_list.append({
             'id': u['id'],
             'username': u['username'],
             'enabled': u.get('enabled', True),
             'auth_method': u.get('auth_method', 'eap-mschapv2'),
             'runtime_status': rt['runtime_status'],
+            'online': rt.get('online'),
+            'last_connected_at': rt.get('last_connected_at'),
+            'last_remote_host': rt.get('last_remote_host'),
             'session_count': rt['session_count'],
             'max_sessions': u.get('max_sessions', 3),
             'virtual_ips': rt['virtual_ips'],
@@ -332,7 +401,9 @@ def tunnels_summary(users, sites, connections):
         'telemetry_available': telemetry_available,
         'totals': {
             'c2s_active_sessions': active_c2s_sessions,
+            'c2s_users_online': c2s_users_online,
             'sites_active': active_sites,
+            'sites_offline': max(0, len(sites) - active_sites) if telemetry_available else 0,
             'sites_total': len(sites),
             'hub_legs_active': active_hub_legs,
             'hub_legs_total': len(hubs) * 2,

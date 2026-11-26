@@ -1,4 +1,4 @@
-import sqlite3, os, json, re, ipaddress, threading, secrets
+import sqlite3, os, json, re, ipaddress, threading, secrets, datetime
 from fastapi import HTTPException
 from auth import init_tokens_table
 
@@ -7,9 +7,18 @@ db=sqlite3.connect(os.environ.get('VPNAAS_DB','/opt/vpnaas/data.sqlite3'),check_
 db.execute('CREATE TABLE IF NOT EXISTS objects (kind TEXT,id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)')
 db.execute('CREATE INDEX IF NOT EXISTS idx_objects_kind ON objects(kind)')
 db.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, timestamp TEXT DEFAULT CURRENT_TIMESTAMP, action TEXT, resource TEXT, resource_id INTEGER)')
+db.execute('''CREATE TABLE IF NOT EXISTS telemetry (
+    kind TEXT NOT NULL,
+    resource_id INTEGER NOT NULL,
+    last_connected_at TEXT,
+    last_seen_at TEXT,
+    last_remote_host TEXT,
+    PRIMARY KEY (kind, resource_id)
+)''')
 init_tokens_table(db)
 
-SCHEMA_VERSION=3
+SCHEMA_VERSION=4
+FIPS_PROFILE='FIPS 140-2/140-3 aligned (IPsec/IKEv2: AES-256/128, SHA-256/384/512, DH14+/ECP256+)'
 TRAFFIC_MODES=('split','full')
 AUTH_METHODS_USER=('eap-mschapv2','pubkey','eap-tls')
 AUTH_METHODS_SITE=('psk','pubkey')
@@ -80,8 +89,92 @@ def default_lan_cidrs():
     return found[:16]
 
 
+def vpc_cidrs(routes=None):
+    """Gateway VPC/LAN CIDRs plus enabled local (non-site) static routes."""
+    routes=rows('routes') if routes is None else routes
+    out=[]
+    def add(c):
+        if c and c!=LAN_PLACEHOLDER and c not in out:out.append(c)
+    try:
+        for c in default_lan_cidrs():add(c)
+    except HTTPException:
+        pass
+    for r in routes:
+        if r.get('enabled',True) and r.get('site_id') is None and (r.get('gateway') or r.get('interface')):
+            add(r.get('destination_cidr'))
+    return out
+
+
+def get_telemetry_map(kind):
+    with lock:
+        cur=db.execute('SELECT resource_id,last_connected_at,last_seen_at,last_remote_host FROM telemetry WHERE kind=?',(kind,))
+        return {
+            rid:{'last_connected_at':lca,'last_seen_at':lsa,'last_remote_host':lrh}
+            for rid,lca,lsa,lrh in cur.fetchall()
+        }
+
+
+def record_telemetry_batch(kind,active_items,min_interval_sec=60):
+    """Persist last_connected_at / last_remote_host for active sites or users.
+
+    Throttles repeat DB writes for steady sessions to once per min_interval_sec,
+    while recording immediately on first connect or remote_host change.
+    """
+    now_dt=datetime.datetime.now(datetime.timezone.utc)
+    now_str=now_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    with lock:
+        cur=db.execute('SELECT resource_id,last_connected_at,last_seen_at,last_remote_host FROM telemetry WHERE kind=?',(kind,))
+        tmap={
+            rid:{'last_connected_at':lca,'last_seen_at':lsa,'last_remote_host':lrh}
+            for rid,lca,lsa,lrh in cur.fetchall()
+        }
+        dirty=False
+        for rid,rhost in active_items:
+            prev=tmap.get(rid)
+            should_write=False
+            if not prev or not prev.get('last_connected_at'):
+                should_write=True
+            elif rhost and rhost!=prev.get('last_remote_host'):
+                should_write=True
+            else:
+                try:
+                    prev_dt=datetime.datetime.strptime(prev['last_connected_at'],'%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+                    if (now_dt-prev_dt).total_seconds()>=min_interval_sec:
+                        should_write=True
+                except Exception:
+                    should_write=True
+            if should_write:
+                eff_host=rhost or (prev.get('last_remote_host') if prev else None)
+                db.execute(
+                    '''INSERT INTO telemetry(kind,resource_id,last_connected_at,last_seen_at,last_remote_host)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(kind,resource_id) DO UPDATE SET
+                         last_connected_at=excluded.last_connected_at,
+                         last_seen_at=excluded.last_seen_at,
+                         last_remote_host=COALESCE(excluded.last_remote_host,telemetry.last_remote_host)''',
+                    (kind,rid,now_str,now_str,eff_host),
+                )
+                tmap[rid]={'last_connected_at':now_str,'last_seen_at':now_str,'last_remote_host':eff_host}
+                dirty=True
+        if dirty:
+            db.commit()
+        return tmap
+
+
+def delete_telemetry(kind,resource_id):
+    db.execute('DELETE FROM telemetry WHERE kind=? AND resource_id=?',(kind,resource_id))
+
+
 def migrate(conn):
-    """v1: traffic_mode. v2: max_sessions. v3: auth_method/groups/allowed_sites defaults on users."""
+    """v1: traffic_mode. v2: max_sessions. v3: auth_method/groups/allowed_sites. v4: allow_vpc/allow_all_sites + telemetry."""
+    conn.execute('''CREATE TABLE IF NOT EXISTS telemetry (
+        kind TEXT NOT NULL,
+        resource_id INTEGER NOT NULL,
+        last_connected_at TEXT,
+        last_seen_at TEXT,
+        last_remote_host TEXT,
+        PRIMARY KEY (kind, resource_id)
+    )''')
     if conn.execute('PRAGMA user_version').fetchone()[0]>=SCHEMA_VERSION:return
     for ident,body in conn.execute("SELECT id,body FROM objects WHERE kind='users'").fetchall():
         data=json.loads(body)
@@ -96,6 +189,10 @@ def migrate(conn):
             data['groups']=[];changed=True
         if 'allowed_sites' not in data:
             data['allowed_sites']=[];changed=True
+        if 'allow_vpc' not in data:
+            data['allow_vpc']=False;changed=True
+        if 'allow_all_sites' not in data:
+            data['allow_all_sites']=False;changed=True
         if changed:
             conn.execute('UPDATE objects SET body=? WHERE id=?',(json.dumps(data),ident))
     conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -137,6 +234,8 @@ def public(row):
         result['auth_method']=row.get('auth_method','eap-mschapv2')
         result['groups']=row.get('groups',[])
         result['allowed_sites']=row.get('allowed_sites',[])
+        result['allow_vpc']=bool(row.get('allow_vpc',False))
+        result['allow_all_sites']=bool(row.get('allow_all_sites',False))
         if 'cert_id' in row:
             result['cert_id']=row['cert_id']
     if 'protocol' in row and ('source_cidr' in row or 'source_type' in row):
@@ -251,14 +350,14 @@ def _check_id_list(value,kind,label,max_items=32):
     return out
 
 
-def _check_cert(cert_id,target_type):
+def _check_cert(cert_id,target_type,allow_revoked=False):
     if type(cert_id) is not int:
         raise HTTPException(422,'cert_id harus berupa integer')
     try:
         cert=get('certs',cert_id)
     except HTTPException:
         raise HTTPException(422,'cert_id tidak ditemukan')
-    if cert.get('revoked'):
+    if cert.get('revoked') and not allow_revoked:
         raise HTTPException(422,'Sertifikat sudah dicabut (revoked)')
     if cert.get('target_type')!=target_type:
         raise HTTPException(422,f'Sertifikat harus bertipe {target_type}')
@@ -282,7 +381,7 @@ def site_effective_subnets(site,routes=None):
 
 
 def effective_user_cidrs(user,groups=None,sites=None,routes=None):
-    """Ordered deduplicated CIDRs accessible by a C2S user (own CIDRs + groups + allowed_sites + site static routes)."""
+    """Ordered deduplicated CIDRs accessible by a C2S user (VPC + own CIDRs + groups + allowed/all sites + site static routes)."""
     groups=rows('groups') if groups is None else groups
     sites=rows('sites') if sites is None else sites
     routes=rows('routes') if routes is None else routes
@@ -291,9 +390,16 @@ def effective_user_cidrs(user,groups=None,sites=None,routes=None):
     out=[]
     def add(c):
         if c and c not in out:out.append(c)
+    if user.get('allow_vpc'):
+        for c in vpc_cidrs(routes):
+            add(c)
     for c in user.get('allowed_cidrs',[]):
         add(c)
     site_ids=list(user.get('allowed_sites',[]))
+    if user.get('allow_all_sites'):
+        for s in sites:
+            if s.get('enabled',True) and s['id'] not in site_ids:
+                site_ids.append(s['id'])
     for gid in user.get('groups',[]):
         g=gmap.get(gid)
         if not g:continue
@@ -309,11 +415,14 @@ def effective_user_cidrs(user,groups=None,sites=None,routes=None):
     return out
 
 
-def effective_user_site_ids(user,groups=None):
-    """Set of Multi-Site IDs granted to a user directly or via enabled groups."""
+def effective_user_site_ids(user,groups=None,sites=None):
+    """Set of Multi-Site IDs granted to a user directly, via allow_all_sites, or via enabled groups."""
     groups=rows('groups') if groups is None else groups
     gmap={g['id']:g for g in groups if g.get('enabled',True)}
     sids=set(user.get('allowed_sites',[]))
+    if user.get('allow_all_sites'):
+        sites=rows('sites') if sites is None else sites
+        sids.update(s['id'] for s in sites if s.get('enabled',True))
     for gid in user.get('groups',[]):
         g=gmap.get(gid)
         if g:sids.update(g.get('allowed_sites',[]))
@@ -329,7 +438,7 @@ MULTI_SITE_FIELDS={'name','address','ike_id','auth_method','psk','cert_id','subn
 GROUP_FIELDS={'name','description','allowed_cidrs','allowed_sites','traffic_mode','max_sessions','enabled'}
 ROUTE_FIELDS={'name','destination_cidr','gateway','interface','metric','site_id','description','enabled'}
 POLICY_FIELDS={'name','source_cidr','destination_cidr','protocol','enabled','action','ports','priority','source_type','source_ref','destination_type','destination_ref','description'}
-USER_FIELDS={'username','password','enabled','allowed_cidrs','traffic_mode','max_sessions','auth_method','groups','allowed_sites','cert_id'}
+USER_FIELDS={'username','password','enabled','allowed_cidrs','traffic_mode','max_sessions','auth_method','groups','allowed_sites','allow_vpc','allow_all_sites','cert_id'}
 
 HOSTNAME=re.compile(r'(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*')
 SITE_NAME=re.compile(r'[A-Za-z0-9 _.@:()-]{1,64}')
@@ -449,7 +558,8 @@ def validate_site(body,old):
     else:
         if 'cert_id' not in data or data['cert_id'] is None:
             raise HTTPException(422,'cert_id wajib untuk auth_method pubkey')
-        data['cert_id']=_check_cert(data['cert_id'],'site')
+        allow_rev=(not data['enabled']) and (data['cert_id']==old.get('cert_id'))
+        data['cert_id']=_check_cert(data['cert_id'],'site',allow_revoked=allow_rev)
         data.pop('psk',None)
     if 'subnets' not in data:raise HTTPException(422,'subnets wajib')
     try:nets=ts_list(data['subnets'],max_items=MAX_SITE_TS,allow_list=True)
@@ -747,19 +857,28 @@ def validate(kind,body,old=None):
                 if data.get('password'):data['password']=credential(data['password'])
                 if 'cert_id' not in data or data['cert_id'] is None:
                     raise HTTPException(422,'cert_id wajib untuk autentikasi sertifikat (pubkey/eap-tls)')
-                data['cert_id']=_check_cert(data['cert_id'],'user')
+                allow_rev=(not data['enabled']) and (data['cert_id']==old.get('cert_id'))
+                data['cert_id']=_check_cert(data['cert_id'],'user',allow_revoked=allow_rev)
             data['groups']=_check_id_list(data.get('groups',[]),'groups','groups')
             data['allowed_sites']=_check_id_list(data.get('allowed_sites',[]),'sites','allowed_sites')
+            data.setdefault('allow_vpc',False)
+            if type(data['allow_vpc']) is not bool:
+                raise HTTPException(422,'allow_vpc harus boolean')
+            data.setdefault('allow_all_sites',False)
+            if type(data['allow_all_sites']) is not bool:
+                raise HTTPException(422,'allow_all_sites harus boolean')
             if 'allowed_cidrs' not in data:
-                if data['groups'] or data['allowed_sites']:
+                if data['allow_vpc'] or data['allow_all_sites'] or data['groups'] or data['allowed_sites']:
                     data['allowed_cidrs']=[]
                 else:
                     data['allowed_cidrs']=default_lan_cidrs()
             if not isinstance(data['allowed_cidrs'],list):raise ValueError()
             data['allowed_cidrs']=[cidr(x) for x in data['allowed_cidrs']]
             if len(data['allowed_cidrs'])>16:raise ValueError()
-            if not data['allowed_cidrs'] and not (data['groups'] or data['allowed_sites']):
-                raise HTTPException(422,'Minimal satu tujuan akses wajib diisi: allowed_cidrs, allowed_sites, atau groups')
+            if not data['allowed_cidrs'] and not (data['allow_vpc'] or data['allow_all_sites'] or data['groups'] or data['allowed_sites']):
+                raise HTTPException(422,'Minimal satu tujuan akses wajib diisi: allow_vpc, allow_all_sites, allowed_sites, allowed_cidrs, atau groups')
+            if data['allow_vpc'] and not (data['allowed_cidrs'] or data['allow_all_sites'] or data['groups'] or data['allowed_sites']) and not vpc_cidrs():
+                raise HTTPException(422,'VPC / LAN privat belum terdeteksi di server; isi allowed_cidrs, static route lokal, atau pilih site')
             # 0/0 is expressed by traffic_mode=full, never as a LAN grant.
             if any(c.endswith('/0') for c in data['allowed_cidrs']):raise ValueError()
             data.setdefault('traffic_mode','split')

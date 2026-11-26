@@ -21,8 +21,10 @@ from auth import (
     revoke_token,
 )
 from store import (
+    FIPS_PROFILE,
     audit,
     db,
+    delete_telemetry,
     detach_site_peers,
     effective_user_cidrs,
     effective_user_site_ids,
@@ -34,6 +36,7 @@ from store import (
     sync_site_peers,
     ts_split,
     validate,
+    vpc_cidrs,
 )
 
 API_VERSION = '2.0.0'
@@ -131,12 +134,57 @@ def with_site_runtime(result):
         all_groups = rows('groups')
         all_policies = rows('policies')
         all_routes = rows('routes')
-    rt = site_runtime(result)
+    rt_all = site_runtime(all_sites)
+    site_by_id = {x['id']: x for x in all_sites}
     out = []
     for s in result:
         lts = site_local_ts(s, sites=all_sites, users=all_users, groups=all_groups, policies=all_policies, routes=all_routes)
-        out.append(dict(s, hub_local_ts=lts, **rt[s['id']]))
+        eff_subs = site_effective_subnets(s, all_routes)
+        peer_details = []
+        for pid in s.get('peer_sites', []):
+            peer = site_by_id.get(pid)
+            if not peer:
+                continue
+            prt = rt_all.get(pid) or {}
+            peer_details.append({
+                'id': pid,
+                'name': peer['name'],
+                'subnets_list': site_effective_subnets(peer, all_routes),
+                'online': prt.get('online'),
+                'status': prt.get('status', 'unknown'),
+                'last_connected_at': prt.get('last_connected_at'),
+            })
+        st = rt_all.get(s['id']) or site_runtime([s])[s['id']]
+        out.append(dict(
+            s,
+            subnets_list=ts_split(s.get('subnets', '')),
+            effective_subnets=eff_subs,
+            hub_local_ts=lts,
+            hub_local_ts_list=ts_split(lts),
+            peer_site_details=peer_details,
+            **st,
+        ))
     return out
+
+
+def _user_access_summary(user, eff_site_ids):
+    has_vpc = bool(user.get('allow_vpc'))
+    all_sites = bool(user.get('allow_all_sites'))
+    has_sites = bool(eff_site_ids or user.get('allowed_sites'))
+    has_custom = bool(user.get('allowed_cidrs') or user.get('groups'))
+    if all_sites and has_vpc:
+        return 'all_sites_and_vpc'
+    if all_sites:
+        return 'all_sites'
+    if has_vpc and has_sites:
+        return 'vpc_and_sites'
+    if has_vpc:
+        return 'vpc_only'
+    if has_sites and not has_custom:
+        return 'sites_only'
+    if has_sites:
+        return 'custom_and_sites'
+    return 'custom'
 
 
 def with_user_effective(result):
@@ -146,7 +194,17 @@ def with_user_effective(result):
         g_rows = rows('groups')
         s_rows = rows('sites')
         r_rows = rows('routes')
-    return [dict(u, effective_cidrs=effective_user_cidrs(u, g_rows, s_rows, r_rows)) for u in result]
+    out = []
+    for u in result:
+        eff_cidrs = effective_user_cidrs(u, g_rows, s_rows, r_rows)
+        eff_sites = sorted(effective_user_site_ids(u, g_rows, s_rows))
+        out.append(dict(
+            u,
+            effective_cidrs=eff_cidrs,
+            effective_site_ids=eff_sites,
+            access_summary=_user_access_summary(u, eff_sites),
+        ))
+    return out
 
 
 def decorate(kind, row):
@@ -157,6 +215,37 @@ def decorate(kind, row):
     if kind == 'users':
         return with_user_effective([row])[0]
     return row
+
+
+def _snapshot_site_ts():
+    """Capture {site_id: (local_ts, effective_subnets)} across enabled sites for targeted SA renegotiation."""
+    from vpn import site_local_ts
+    all_sites = rows('sites')
+    if not all_sites:
+        return {}
+    all_users = rows('users')
+    all_groups = rows('groups')
+    all_policies = rows('policies')
+    all_routes = rows('routes')
+    snap = {}
+    for s in all_sites:
+        if not s.get('enabled', True):
+            continue
+        lts = site_local_ts(s, sites=all_sites, users=all_users, groups=all_groups, policies=all_policies, routes=all_routes)
+        snap[s['id']] = (lts, tuple(site_effective_subnets(s, all_routes)))
+    return snap
+
+
+def _revoke_changed_sites(before_ts, after_ts, already_revoked=None):
+    """Revoke ONLY sites whose Hub local_ts or effective_subnets changed so spokes renegotiate immediately."""
+    from vpn import revoke
+    revoked = set(already_revoked or ())
+    for sid, after_val in after_ts.items():
+        if sid in revoked:
+            continue
+        if sid in before_ts and before_ts[sid] != after_val:
+            revoke('sites', sid)
+            revoked.add(sid)
 
 
 def register(kind):
@@ -188,6 +277,7 @@ def register(kind):
 
     def create(body: dict):
         with lock:
+            before_ts = _snapshot_site_ts()
             data = validate(kind, body)
             try:
                 cur = db.execute('INSERT INTO objects(kind,body) VALUES(?,?)', (kind, json.dumps(data)))
@@ -196,13 +286,33 @@ def register(kind):
                 if kind == 'sites' and data.get('peer_sites'):
                     changed_peers = sync_site_peers(ident, data['peer_sites'])
                 apply_configuration()
+                after_ts = _snapshot_site_ts()
+                revoked_sites = set()
                 if changed_peers:
                     from vpn import revoke
                     for pid in changed_peers:
                         revoke('sites', pid)
-                if kind == 'routes' and data.get('site_id'):
+                        revoked_sites.add(pid)
+                if kind == 'sites' and data.get('enabled', True):
                     from vpn import revoke
-                    revoke('sites', data['site_id'])
+                    for u in rows('users'):
+                        if u.get('allow_all_sites'):
+                            revoke('users', u['id'])
+                if kind == 'routes':
+                    from vpn import revoke
+                    if data.get('site_id'):
+                        revoke('sites', data['site_id'])
+                        revoked_sites.add(data['site_id'])
+                        g_rows = rows('groups')
+                        s_rows = rows('sites')
+                        for u in rows('users'):
+                            if u.get('allow_all_sites') or data['site_id'] in effective_user_site_ids(u, g_rows, s_rows):
+                                revoke('users', u['id'])
+                    else:
+                        for u in rows('users'):
+                            if u.get('enabled', True) and u.get('allow_vpc'):
+                                revoke('users', u['id'])
+                _revoke_changed_sites(before_ts, after_ts, already_revoked=revoked_sites)
                 audit('create', kind, ident)
                 db.commit()
                 return decorate(kind, public(dict(data, id=ident)))
@@ -212,6 +322,7 @@ def register(kind):
 
     def update(ident: int, body: dict):
         with lock:
+            before_ts = _snapshot_site_ts()
             previous = get(kind, ident)
             data = validate(kind, body, previous)
             try:
@@ -222,16 +333,22 @@ def register(kind):
                 # Apply new config BEFORE revoking SA so failed apply never kills live SAs
                 # and revoked sessions cannot race-reconnect using removed credentials.
                 apply_configuration()
+                after_ts = _snapshot_site_ts()
                 from vpn import revoke
+                revoked_sites = set()
                 if kind in ('users', 'connections', 'sites'):
                     revoke(kind, ident, **({'row': previous} if kind == 'connections' else {}))
+                    if kind == 'sites':
+                        revoked_sites.add(ident)
                 if kind == 'sites':
                     for pid in changed_peers:
                         revoke('sites', pid)
+                        revoked_sites.add(pid)
                     if previous.get('subnets') != data.get('subnets') or previous.get('enabled', True) != data.get('enabled', True):
                         g_rows = rows('groups')
+                        s_rows = rows('sites')
                         for u in rows('users'):
-                            if ident in effective_user_site_ids(u, g_rows):
+                            if u.get('allow_all_sites') or ident in effective_user_site_ids(u, g_rows, s_rows):
                                 revoke('users', u['id'])
                 elif kind == 'groups':
                     for u in rows('users'):
@@ -241,6 +358,17 @@ def register(kind):
                     affected_sites = {s for s in (previous.get('site_id'), data.get('site_id')) if s is not None}
                     for sid in affected_sites:
                         revoke('sites', sid)
+                        revoked_sites.add(sid)
+                    local_changed = (previous.get('site_id') is None) or (data.get('site_id') is None)
+                    if affected_sites or local_changed:
+                        g_rows = rows('groups')
+                        s_rows = rows('sites')
+                        for u in rows('users'):
+                            if (affected_sites and (u.get('allow_all_sites') or (affected_sites & effective_user_site_ids(u, g_rows, s_rows)))) or (
+                                local_changed and u.get('enabled', True) and u.get('allow_vpc')
+                            ):
+                                revoke('users', u['id'])
+                _revoke_changed_sites(before_ts, after_ts, already_revoked=revoked_sites)
                 audit('update', kind, ident)
                 db.commit()
                 return decorate(kind, public(dict(data, id=ident)))
@@ -250,21 +378,45 @@ def register(kind):
 
     def delete(ident: int):
         with lock:
+            before_ts = _snapshot_site_ts()
             previous = get(kind, ident)
             _check_delete_references(kind, ident)
             try:
                 db.execute('DELETE FROM objects WHERE id=?', (ident,))
+                if kind in ('sites', 'users'):
+                    delete_telemetry(kind, ident)
                 changed_peers = []
                 if kind == 'sites':
                     changed_peers = detach_site_peers(ident)
                 apply_configuration()
+                after_ts = _snapshot_site_ts()
                 from vpn import revoke
+                revoked_sites = set()
                 if kind in ('users', 'connections', 'sites'):
                     revoke(kind, ident, **({'row': previous} if kind == 'connections' else {}))
+                    if kind == 'sites':
+                        revoked_sites.add(ident)
+                if kind == 'sites':
+                    for u in rows('users'):
+                        if u.get('allow_all_sites'):
+                            revoke('users', u['id'])
                 for pid in changed_peers:
                     revoke('sites', pid)
-                if kind == 'routes' and previous.get('site_id'):
-                    revoke('sites', previous['site_id'])
+                    revoked_sites.add(pid)
+                if kind == 'routes':
+                    if previous.get('site_id'):
+                        revoke('sites', previous['site_id'])
+                        revoked_sites.add(previous['site_id'])
+                        g_rows = rows('groups')
+                        s_rows = rows('sites')
+                        for u in rows('users'):
+                            if u.get('allow_all_sites') or previous['site_id'] in effective_user_site_ids(u, g_rows, s_rows):
+                                revoke('users', u['id'])
+                    else:
+                        for u in rows('users'):
+                            if u.get('enabled', True) and u.get('allow_vpc'):
+                                revoke('users', u['id'])
+                _revoke_changed_sites(before_ts, after_ts, already_revoked=revoked_sites)
                 audit('delete', kind, ident)
                 db.commit()
                 return {'deleted': True}
@@ -359,35 +511,56 @@ def readiness():
 def gateway_metadata():
     """Gateway instance metadata for Customer Portal / Orchestrator integration."""
     from pool import network
-    from vpn import lan_cidr, public_if, public_ip
+    from store import LAN_PLACEHOLDER
+    from vpn import bind_ip, lan_cidr, public_if, public_ip
     import pki
     import tuning
 
+    with lock:
+        all_routes = rows('routes')
+        counts = {k: len(rows(k)) for k in ('sites', 'users', 'groups', 'routes', 'policies', 'certs')}
+    detected_vpcs = vpc_cidrs(all_routes)
+    effective_lan = detected_vpcs[0] if (lan_cidr() == LAN_PLACEHOLDER and detected_vpcs) else lan_cidr()
+
     return {
         'api_version': API_VERSION,
+        'protocol': 'IPsec/IKEv2',
         'engine': 'strongSwan IKEv2/IPsec',
+        'default_traffic_mode': 'split',
+        'fips_compliant': True,
+        'fips_profile': FIPS_PROFILE,
         'region': os.environ.get('VPNAAS_REGION', 'unspecified'),
         'tenant_id': os.environ.get('VPNAAS_TENANT_ID', ''),
         'instance_id': os.environ.get('VPNAAS_INSTANCE_ID', ''),
         'public_ip': public_ip(),
+        'bind_ip': bind_ip(),
         'public_if': public_if(),
-        'lan_cidr': lan_cidr(),
+        'lan_cidr': effective_lan,
+        'vpc_cidrs': detected_vpcs,
         'pool_cidr': str(network()),
         'route_auto': os.environ.get('VPNAAS_ROUTE_AUTO') == '1',
+        'counts': counts,
         'capabilities': {
+            'fips_ikev2_only': True,
+            'split_tunnel_default': True,
+            'golden_image_bootstrap': True,
             'ikev2_s2s_multisite': True,
             'ikev2_s2s_hub_legacy': True,
             'ikev2_s2s_direct_legacy': True,
             'ikev2_c2s_eap_mschapv2': True,
             'ikev2_c2s_cert_pubkey': True,
             'ikev2_c2s_eap_tls': True,
+            'c2s_allow_vpc': True,
+            'c2s_allow_all_sites': True,
             'c2s_groups': True,
             'c2s_to_s2s': True,
+            'site_last_connected': True,
+            's2s_zero_touch_narrowing': True,
             'static_routing': True,
             'granular_acl_ports_deny': True,
             'pki_crl': True,
-            'vendor_configs': ['swanctl', 'script', 'mikrotik', 'fortigate', 'cisco'],
-            'client_profiles': ['json', 'mobileconfig', 'sswan', 'windows'],
+            'vendor_configs': ['generic', 'swanctl', 'script', 'mikrotik', 'fortigate', 'cisco'],
+            'client_profiles': ['json', 'mobileconfig', 'sswan', 'windows', 'manual'],
             'token_rbac': True,
             'openvpn': False,
             'bgp': False,
@@ -476,7 +649,7 @@ def api_tokens_revoke(ident: int):
 @app.get('/api/users/{ident}/profile', dependencies=[Depends(require_operator)])
 def profile(
     ident: int,
-    format: Literal['json', 'mobileconfig', 'sswan', 'windows'] = 'json',
+    format: Literal['json', 'mobileconfig', 'sswan', 'windows', 'manual'] = 'json',
     p12_passphrase: str = Query(default=''),
 ):
     import pki
@@ -529,6 +702,12 @@ def profile(
             media_type='application/vnd.strongswan.profile+json',
             headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{fname}"'},
         )
+    if format == 'manual':
+        txt, fname = profiles.build_manual_conf(data)
+        return PlainTextResponse(
+            txt,
+            headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{fname}"'},
+        )
     ps1, fname = profiles.build_windows_ps1(data)
     return PlainTextResponse(
         ps1,
@@ -565,7 +744,8 @@ def user_disconnect_session(ident: int, ike_id: str):
 @app.get('/api/sites/{ident}/config', dependencies=[Depends(require_operator)])
 def site_n_config(
     ident: int,
-    vendor: Literal['swanctl', 'script', 'mikrotik', 'fortigate', 'cisco'] = 'swanctl',
+    vendor: Literal['generic', 'swanctl', 'script', 'mikrotik', 'fortigate', 'cisco'] = 'swanctl',
+    dynamic_ts: bool = Query(default=True),
 ):
     from vpn import site_local_ts
     import vendors
@@ -577,8 +757,9 @@ def site_n_config(
         all_groups = rows('groups')
         all_policies = rows('policies')
         all_routes = rows('routes')
+        cert_row = get('certs', s['cert_id']) if s.get('cert_id') else None
     local_ts = site_local_ts(s, sites=all_sites, users=all_users, groups=all_groups, policies=all_policies, routes=all_routes)
-    text, fname = vendors.generate_for_site(s, local_ts, vendor=vendor, routes=all_routes)
+    text, fname = vendors.generate_for_site(s, local_ts, vendor=vendor, routes=all_routes, dynamic_ts=dynamic_ts, cert_row=cert_row)
     return PlainTextResponse(
         text,
         headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{fname}"'},
@@ -662,11 +843,17 @@ def pki_ca_status():
 
 
 @app.get('/api/pki/ca/cert', dependencies=[Depends(require_readonly)])
-def pki_ca_download():
+def pki_ca_download(format: Literal['pem', 'crt'] = 'pem'):
     import pki
     pem = pki.ca_pem()
     if not pem:
         raise HTTPException(404, 'CA certificate not found')
+    if format == 'crt':
+        return PlainTextResponse(
+            pem,
+            media_type='application/x-x509-ca-cert',
+            headers={'Content-Disposition': 'attachment; filename="vpnaas-ca.crt"'},
+        )
     return PlainTextResponse(
         pem,
         media_type='application/x-pem-file',
@@ -752,7 +939,7 @@ def pki_certs_issue(body: dict):
 @app.get('/api/pki/certs/{ident}/bundle', dependencies=[Depends(require_operator)])
 def pki_certs_bundle(
     ident: int,
-    format: Literal['pem', 'p12'] = 'pem',
+    format: Literal['pem', 'p12', 'crt', 'key'] = 'pem',
     passphrase: str = Query(default=''),
 ):
     import pki
@@ -762,6 +949,18 @@ def pki_certs_bundle(
         cert = get('certs', ident)
     ca_pem = pki.ca_pem()
     safe_name = profiles._safe_filename(cert['name'])
+    if format == 'crt':
+        return PlainTextResponse(
+            cert['cert_pem'],
+            media_type='application/x-x509-ca-cert',
+            headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{safe_name}.crt"'},
+        )
+    if format == 'key':
+        return PlainTextResponse(
+            cert['private_key_pem'],
+            media_type='application/x-pem-file',
+            headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{safe_name}.key"'},
+        )
     if format == 'p12':
         raw = pki.build_pkcs12(
             cert['cert_pem'],
@@ -874,6 +1073,39 @@ def service_logs(
         raise HTTPException(503, f'Unable to read logs for {unit}')
 
 
+def _diag_proto_port_match(policy, proto, port):
+    p_proto = policy.get('protocol', 'all')
+    if p_proto != 'all' and p_proto != proto:
+        return False
+    p_ports = policy.get('ports')
+    if not p_ports or p_proto not in ('tcp', 'udp'):
+        return True
+    if port is None:
+        return True
+    for part in str(p_ports).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            if int(lo) <= port <= int(hi):
+                return True
+        elif int(part) == port:
+            return True
+    return False
+
+
+def _diag_policy_dst_nets(policy, matched_site, target_net, all_routes):
+    dt = policy.get('destination_type', 'cidr')
+    if dt == 'cidr' and policy.get('destination_cidr'):
+        return [ipaddress.IPv4Network(policy['destination_cidr'])]
+    if dt == 'site' and matched_site and policy.get('destination_ref') == matched_site['id']:
+        return [target_net]
+    if dt == 'vpc':
+        return [ipaddress.IPv4Network(vc) for vc in vpc_cidrs(all_routes)]
+    return []
+
+
 @app.post('/api/diagnostics/check', dependencies=[Depends(require_operator)])
 def diagnostics_check(body: dict):
     """Verify tunnel + route + policy path readiness for a target IPv4 address/CIDR."""
@@ -935,14 +1167,17 @@ def diagnostics_check(body: dict):
                     break
 
     # 2. Evaluate effective ACL / policy decision
+    ordered_policies = sorted(
+        [p for p in all_policies if p.get('enabled', True)],
+        key=lambda x: (x.get('priority', 100), x['id']),
+    )
     policy_allowed = None
     policy_reason = 'no source specified'
     if src_user:
         eff = [ipaddress.IPv4Network(c) for c in effective_user_cidrs(src_user, all_groups, all_sites, all_routes)]
         in_grants = any(target_net.subnet_of(n) for n in eff)
-        # Check explicit user/group deny policies
         explicit_deny = False
-        for p in sorted([p for p in all_policies if p.get('enabled', True)], key=lambda x: (x.get('priority', 100), x['id'])):
+        for p in ordered_policies:
             if p.get('action', 'allow') != 'deny':
                 continue
             src_match = (p.get('source_type') == 'user' and p.get('source_ref') == src_user['id']) or (
@@ -950,17 +1185,11 @@ def diagnostics_check(body: dict):
             )
             if not src_match:
                 continue
-            dt = p.get('destination_type', 'cidr')
-            dst_nets = []
-            if dt == 'cidr' and p.get('destination_cidr'):
-                dst_nets = [ipaddress.IPv4Network(p['destination_cidr'])]
-            elif dt == 'site' and matched_site and p.get('destination_ref') == matched_site['id']:
-                dst_nets = [target_net]
-            if any(target_net.subnet_of(dn) for dn in dst_nets):
-                if p.get('protocol') in ('all', proto):
-                    explicit_deny = True
-                    policy_reason = f"Blocked by deny policy '{p['name']}'"
-                    break
+            dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
+            if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
+                explicit_deny = True
+                policy_reason = f"Blocked by deny policy '{p['name']}'"
+                break
         if explicit_deny:
             policy_allowed = False
         elif in_grants:
@@ -972,18 +1201,63 @@ def diagnostics_check(body: dict):
         else:
             policy_allowed = False
             policy_reason = 'Denied by default-deny policy'
-    elif src_site and matched_site:
+    elif src_site:
         from vpn import _policy_connects_sites, _sites_are_peered
-        if src_site['id'] == matched_site['id']:
-            policy_allowed = True
-            policy_reason = 'Same site'
-        elif _sites_are_peered(src_site, matched_site):
-            policy_allowed = True
-            policy_reason = f"Permitted by bidirectional site peering ({src_site['name']} <-> {matched_site['name']})"
+        src_site_nets = [ipaddress.IPv4Network(c) for c in site_effective_subnets(src_site, all_routes)]
+        # Explicit DENY policies run BEFORE peer_sites / allow_vpc / allow policies (matching vpn.firewall).
+        blocked_by = None
+        for p in ordered_policies:
+            if p.get('action', 'allow') != 'deny':
+                continue
+            st = p.get('source_type', 'cidr')
+            src_match = (st == 'site' and p.get('source_ref') == src_site['id']) or (
+                st == 'cidr' and p.get('source_cidr') and any(sn.overlaps(ipaddress.IPv4Network(p['source_cidr'])) for sn in src_site_nets)
+            )
+            if not src_match:
+                continue
+            dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
+            if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
+                blocked_by = p
+                break
+        if blocked_by:
+            policy_allowed = False
+            policy_reason = f"Blocked by deny policy '{blocked_by['name']}'"
+        elif matched_site:
+            if src_site['id'] == matched_site['id']:
+                policy_allowed = True
+                policy_reason = 'Same site'
+            elif _sites_are_peered(src_site, matched_site):
+                policy_allowed = True
+                policy_reason = f"Permitted by bidirectional site peering ({src_site['name']} <-> {matched_site['name']})"
+            else:
+                allowed_p = next(
+                    (p for p in ordered_policies if _policy_connects_sites(p, src_site, matched_site, routes=all_routes) and _diag_proto_port_match(p, proto, port)),
+                    None,
+                )
+                policy_allowed = bool(allowed_p)
+                policy_reason = f"Permitted by policy '{allowed_p['name']}'" if allowed_p else 'Denied by default-deny inter-site policy'
         else:
-            allowed_p = next((p for p in all_policies if _policy_connects_sites(p, src_site, matched_site)), None)
-            policy_allowed = bool(allowed_p)
-            policy_reason = f"Permitted by policy '{allowed_p['name']}'" if allowed_p else 'Denied by default-deny inter-site policy'
+            vpc_nets = [ipaddress.IPv4Network(vc) for vc in vpc_cidrs(all_routes)]
+            if any(target_net.subnet_of(vn) for vn in vpc_nets) and src_site.get('allow_vpc', True):
+                policy_allowed = True
+                policy_reason = f"Permitted by site allow_vpc ({src_site['name']} <-> VPC)"
+            else:
+                allowed_p = None
+                for p in ordered_policies:
+                    if p.get('action', 'allow') != 'allow':
+                        continue
+                    st = p.get('source_type', 'cidr')
+                    src_match = (st == 'site' and p.get('source_ref') == src_site['id']) or (
+                        st == 'cidr' and p.get('source_cidr') and any(sn.overlaps(ipaddress.IPv4Network(p['source_cidr'])) for sn in src_site_nets)
+                    )
+                    if not src_match:
+                        continue
+                    dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
+                    if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
+                        allowed_p = p
+                        break
+                policy_allowed = bool(allowed_p)
+                policy_reason = f"Permitted by policy '{allowed_p['name']}'" if allowed_p else 'Denied by default-deny policy'
 
     # 3. Kernel route & Tunnel status
     route_info = {'available': False, 'interface': None}

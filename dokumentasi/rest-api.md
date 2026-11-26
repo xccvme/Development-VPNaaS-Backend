@@ -454,23 +454,24 @@ Route dokumentasi `/docs`, `/redoc`, dan `/openapi.json` dinonaktifkan secara pu
 | Metode | Path | Role Min | Fungsi |
 |---|---|---|---|
 | GET | `/api/ready` | readonly | Deep readiness probe provisioning CP (SQLite, strongSwan/VICI, nftables, PKI) — `200` READY / `503` DEGRADED |
-| GET | `/api/gateway` | readonly | Metadata gateway (`region`, `tenant_id`, `instance_id`, `public_ip`, `pool_cidr`, `capabilities`, `pki`) |
+| GET | `/api/gateway` | readonly | Metadata gateway Enterprise (`protocol: "IPsec/IKEv2"`, `fips_compliant`, `fips_profile`, `vpc_cidrs`, `counts`, `region`, `tenant_id`, `instance_id`, `public_ip`, `pool_cidr`, `capabilities`, `pki`) |
 | GET | `/api/openapi.json` | readonly | Spesifikasi OpenAPI terautentikasi |
 | GET / POST / DELETE | `/api/tokens`, `/api/tokens/{id}` | admin | Manajemen token API berbasis hash SHA-256 (plaintext dikembalikan sekali saat create, `no-store`) |
-| GET / POST / PUT / DELETE | `/api/sites`, `/api/sites/{id}` | readonly / operator | **Multi-Site S2S (Site-A/B/.../N)** dengan default-deny inter-site, auth `psk` atau `pubkey`, custom strong IKE/ESP presets, runtime (`active`/`down`/`unknown`) |
-| GET | `/api/sites/{id}/config?vendor=...` | operator | Generator config S2S multi-vendor: `swanctl`, `script`, `mikrotik`, `fortigate`, `cisco` (`no-store`) |
+| GET / POST / PUT / DELETE | `/api/sites`, `/api/sites/{id}` | readonly / operator | **Enterprise Multi-Site S2S (Site-A → Site-N)** satu per satu, peering selektif simetris (`peer_sites` + `peer_site_details`), default-deny inter-site, auth `psk` atau `pubkey`, custom FIPS IKE/ESP presets, runtime (`online`, `connection_state`: `online\|offline\|unknown`, `last_connected_at`, `last_remote_host`, `effective_subnets`) |
+| GET | `/api/sites/{id}/config?vendor=...&dynamic_ts=true\|false` | operator | Generator config S2S multi-vendor: `generic` (Enterprise Manual Parameter Sheet `.conf` untuk MikroTik/Switch/Firewall apa pun), `swanctl` & `script` (default `dynamic_ts=true`: **Zero-Touch IKEv2 Narrowing**), `mikrotik` (termasuk inbound NAT masquerade bila `nat=true`), `fortigate`, `cisco` (`no-store`) |
 | POST | `/api/sites/{id}/connect`, `/disconnect` | operator | Inisiasi/terminasi tunnel Multi-Site (`409` bila disabled atau `%any`) |
+| GET / POST / PUT / DELETE | `/api/users`, `/api/users/{id}` | readonly / operator | **Enterprise C2S IPsec/IKEv2** dengan pilihan akses fleksibel: `allow_vpc` (VPC/NAT server, bekerja meski 0 site), `allow_all_sites` (semua site S2S termasuk site baru), `allowed_sites` (site spesifik), `groups`, `allowed_cidrs`, plus runtime `online`, `last_connected_at`, `effective_cidrs`, `effective_site_ids`, `access_summary` |
 | GET / POST / PUT / DELETE | `/api/groups`, `/api/groups/{id}` | readonly / operator | Grup user C2S (`allowed_cidrs`, `allowed_sites`, `traffic_mode`, `max_sessions`) |
 | POST | `/api/users/{id}/disconnect` | operator | Putuskan seluruh sesi aktif milik akun C2S |
 | POST | `/api/users/{id}/sessions/{ike_id}/disconnect` | operator | Putuskan 1 sesi IKE spesifik berdasarkan numeric `ike_id` |
-| GET | `/api/users/{id}/profile?format=...` | operator | Profil multi-platform: `json` (default), `mobileconfig` (macOS/iOS), `sswan` (Android strongSwan), `windows` (`.ps1`) |
+| GET | `/api/users/{id}/profile?format=...` | operator | Profil multi-platform: `json` (default), `manual` (panduan `.conf`), `mobileconfig` (macOS/iOS), `sswan` (Android strongSwan), `windows` (`.ps1`) |
 | GET / POST / PUT / DELETE | `/api/routes`, `/api/routes/{id}` | readonly / operator | Static routing Linux terisolasi (`proto 188`) |
 | GET | `/api/routes/live` | readonly | Status sinkronisasi static route + tabel route kernel `main` |
 | GET | `/api/policies/{id}` | readonly | Detail 1 firewall policy (kini mendukung `action: allow\|deny`, `ports`, `priority`, `source_type/ref` `cidr\|site\|user\|group`, `destination_type/ref` `cidr\|site\|vpc`) |
-| GET | `/api/pki/ca`, `/api/pki/ca/cert` | readonly | Info & unduh Root CA PEM |
+| GET | `/api/pki/ca`, `/api/pki/ca/cert?format=pem\|crt` | readonly | Info & unduh Root CA (`.pem` / `.crt`) |
 | GET / POST | `/api/pki/server`, `/api/pki/server/rotate` | readonly / admin | Info masa berlaku sertifikat server & rotasi tanpa mengganti CA |
 | GET / POST | `/api/pki/certs`, `/api/pki/certs/{id}` | readonly / operator | Terbitkan & lihat sertifikat X.509 untuk user (`clientAuth`) atau site (`clientAuth`+`serverAuth`) |
-| GET | `/api/pki/certs/{id}/bundle?format=pem\|p12` | operator | Unduh bundle PEM atau PKCS#12 `.p12` (`no-store`) |
+| GET | `/api/pki/certs/{id}/bundle?format=pem\|p12\|crt\|key` | operator | Unduh bundle JSON PEM, PKCS#12 `.p12`, sertifikat leaf `.crt`, atau private key `.key` (`no-store`) |
 | POST | `/api/pki/certs/{id}/revoke` | operator | Cabut sertifikat, bangun & pasang ulang CRL (`/etc/swanctl/x509crl/ca.crl`), dan putus SA aktif terkait |
 | GET | `/api/pki/crl` | readonly | Unduh CRL PEM terbaru |
 | GET | `/api/monitoring/tunnels` | readonly | Ringkasan telemetry terpadu (C2S + Multi-Site + Hub + Direct, total bytes in/out) |

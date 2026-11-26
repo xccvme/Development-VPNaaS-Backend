@@ -70,11 +70,22 @@ def enforce_once():
     if os.environ.get('VPNAAS_DRY_RUN') == '1':
         return []
     import vpn
+    from runtime import site_runtime, user_runtime
     from vici_client import list_sas
     from store import lock, rows, audit, db
     sas = list_sas()
     with lock:
-        users = [u for u in rows('users') if u.get('enabled', True)]
+        all_users = rows('users')
+        users = [u for u in all_users if u.get('enabled', True)]
+        all_sites = rows('sites')
+    # Reuse the single VICI snapshot to persist last_connected_at even when no UI/Portal polls.
+    try:
+        if all_sites:
+            site_runtime(all_sites, sas=sas)
+        if all_users:
+            user_runtime(all_users, sas=sas)
+    except Exception:
+        pass
     actions = []
     for user, ike_id in plan(users, sas):
         ok = True

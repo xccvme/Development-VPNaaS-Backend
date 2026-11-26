@@ -11,6 +11,7 @@ root = Path(__file__).resolve().parent
 files = (
     'app.py',
     'auth.py',
+    'bootstrap.py',
     'network.py',
     'pki.py',
     'pool.py',

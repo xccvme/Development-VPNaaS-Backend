@@ -15,7 +15,7 @@ import uuid
 import xml.sax.saxutils as xmlutil
 
 
-PROFILE_FORMATS = ('json', 'mobileconfig', 'sswan', 'windows')
+PROFILE_FORMATS = ('json', 'mobileconfig', 'sswan', 'windows', 'manual')
 
 
 def _safe_filename(name: str, fallback: str = 'user') -> str:
@@ -298,6 +298,11 @@ def build_windows_ps1(profile: dict) -> tuple:
     cidrs = profile.get('allowed_cidrs', [])
 
     auth_flag = 'MachineCertificate' if auth_method == 'pubkey' else 'Eap'
+    cert_note = ''
+    if auth_method == 'pubkey':
+        cert_note = '# Catatan X.509: Import bundle .p12 client ke Cert:\\LocalMachine\\My sebelum Connect.\n'
+    elif auth_method == 'eap-tls':
+        cert_note = '# Catatan EAP-TLS: Import bundle .p12 client ke Cert:\\CurrentUser\\My dan pilih Smart Card/Certificate pada EAP.\n'
     route_lines = []
     if mode != 'full':
         for c in cidrs:
@@ -307,7 +312,7 @@ def build_windows_ps1(profile: dict) -> tuple:
     ps1 = f'''#Requires -RunAsAdministrator
 # VPNaaS Windows Native IKEv2 Setup - {user}
 # Jalankan di PowerShell (Run as Administrator). Password dimasukkan saat Connect.
-$ErrorActionPreference = 'Stop'
+{cert_note}$ErrorActionPreference = 'Stop'
 $ConnName = '{user}'
 $Server   = '{server}'
 
@@ -336,3 +341,66 @@ Write-Host "Profil VPN '$ConnName' ($Server, mode={mode}, auth={auth_method}) si
 '''
     fname = f'Setup-Client-{_safe_filename(user)}.ps1'
     return ps1, fname
+
+
+def build_manual_conf(profile: dict) -> tuple:
+    """Generate universal manual setup parameter sheet (.conf) for any IKEv2 C2S client."""
+    user = profile['username']
+    server = profile['server']
+    server_id = profile['server_id']
+    mode = profile['traffic_mode']
+    auth_method = profile.get('auth_method', 'eap-mschapv2')
+    cidrs = profile.get('allowed_cidrs', [])
+    dns_list = profile.get('dns', [])
+
+    auth_desc = {
+        'eap-mschapv2': 'EAP-MSCHAPv2 (Username & Password + Server Root CA)',
+        'pubkey': 'X.509 Mutual Certificate (Client Cert + Root CA)',
+        'eap-tls': 'EAP-TLS (Client Certificate + Root CA)',
+    }.get(auth_method, auth_method)
+
+    lines = [
+        '# ==========================================================================',
+        f'# VPNaaS Client-to-Site (C2S) IPsec/IKEv2 Manual Configuration Guide',
+        f'# Account: {user}',
+        '# Cocok untuk: Windows GUI, macOS/iOS, Linux NetworkManager/strongSwan,',
+        '#              Android, atau router/perangkat IKEv2 client lainnya.',
+        '# ==========================================================================',
+        '',
+        '[GATEWAY_SERVER]',
+        f'server_address     = {server}',
+        f'remote_id          = {server_id}',
+        'protocol           = IPsec/IKEv2 (FIPS 140-2/140-3 aligned)',
+        'udp_ports          = 500, 4500 (NAT-Traversal)',
+        '',
+        '[AUTHENTICATION]',
+        f'auth_method        = {auth_desc}',
+        f'username           = {user}',
+        f'virtual_ip         = {profile.get("virtual_ip", "")}',
+        'root_ca_cert       = Unduh vpnaas-ca.crt dan install ke Trusted Root CA perangkat client',
+    ]
+    if auth_method in ('pubkey', 'eap-tls'):
+        lines += [
+            f'client_id          = {profile.get("client_id", user)}',
+            f'client_cert_serial = {profile.get("client_serial", "-")}',
+            'client_cert_files  = Unduh Client Cert (.p12 atau .crt + .key) dari menu Configure/PKI',
+        ]
+    else:
+        lines += [
+            'password_note      = Masukkan password akun saat connect (tidak dicetak plaintext di panduan ini; lihat .json jika perlu)',
+        ]
+    lines += [
+        '',
+        '[CRYPTO_FIPS]',
+        'ike_proposals      = aes256-sha256-modp2048, aes128-sha256-modp2048 (DH Group 14)',
+        'esp_proposals      = aes256-sha256, aes128-sha256',
+        '',
+        '[ROUTING_AND_ACCESS]',
+        f'traffic_mode       = {mode} ({"semua internet + subnet di bawah lewat VPN" if mode == "full" else "hanya subnet di bawah lewat VPN"})',
+        f'allowed_subnets    = {", ".join(cidrs) if cidrs else "-"}',
+    ]
+    if dns_list:
+        lines.append(f'full_tunnel_dns    = {", ".join(dns_list)}')
+    lines.append('')
+    fname = f'VPNaaS-Client-{_safe_filename(user)}.conf'
+    return '\n'.join(lines), fname
