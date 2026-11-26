@@ -884,16 +884,40 @@ def pki_server_rotate(body: Optional[dict] = Body(default=None)):
     return result
 
 
+def _refresh_cert_expiry(row: dict) -> dict:
+    """Recompute days_remaining and expired dynamically from not_after so persisted cert rows never go stale."""
+    import datetime
+    out = dict(row)
+    not_after_s = out.get('not_after')
+    if out.get('no_expiration') or (isinstance(not_after_s, str) and not_after_s.startswith('9999-')):
+        out['no_expiration'] = True
+        out['days_remaining'] = None
+        out['expired'] = False
+        return out
+    if isinstance(not_after_s, str) and not_after_s:
+        try:
+            na = datetime.datetime.fromisoformat(not_after_s.replace('Z', '+00:00'))
+            if na.tzinfo is None:
+                na = na.replace(tzinfo=datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            out['no_expiration'] = False
+            out['days_remaining'] = int((na - now).total_seconds() // 86400)
+            out['expired'] = now >= na
+        except ValueError:
+            pass
+    return out
+
+
 @app.get('/api/pki/certs', dependencies=[Depends(require_readonly)])
 def pki_certs_list():
     with lock:
-        return [public(c) for c in rows('certs')]
+        return [_refresh_cert_expiry(public(c)) for c in rows('certs')]
 
 
 @app.get('/api/pki/certs/{ident}', dependencies=[Depends(require_readonly)])
 def pki_certs_detail(ident: int):
     with lock:
-        return public(get('certs', ident))
+        return _refresh_cert_expiry(public(get('certs', ident)))
 
 
 @app.post('/api/pki/certs', dependencies=[Depends(require_operator)])
@@ -1002,21 +1026,25 @@ def pki_certs_revoke(ident: int):
 
     with lock:
         cert = get('certs', ident)
-        if not cert.get('revoked'):
-            cert['revoked'] = True
-            cert['revoked_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            body = {k: v for k, v in cert.items() if k != 'id'}
-            db.execute('UPDATE objects SET body=? WHERE id=?', (json.dumps(body), ident))
-        revoked_rows = [c for c in rows('certs') if c.get('revoked')]
-        affected_users = [u for u in rows('users') if u.get('cert_id') == ident]
-        affected_sites = [s for s in rows('sites') if s.get('cert_id') == ident]
-        pki.rebuild_crl(revoked_rows)
-        for u in affected_users:
-            revoke_sa('users', u['id'])
-        for s in affected_sites:
-            revoke_sa('sites', s['id'])
-        audit('revoke', 'certs', ident)
-        db.commit()
+        try:
+            if not cert.get('revoked'):
+                cert['revoked'] = True
+                cert['revoked_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                body = {k: v for k, v in cert.items() if k != 'id'}
+                db.execute('UPDATE objects SET body=? WHERE id=?', (json.dumps(body), ident))
+            revoked_rows = [c for c in rows('certs') if c.get('revoked')]
+            affected_users = [u for u in rows('users') if u.get('cert_id') == ident]
+            affected_sites = [s for s in rows('sites') if s.get('cert_id') == ident]
+            pki.rebuild_crl(revoked_rows)
+            for u in affected_users:
+                revoke_sa('users', u['id'])
+            for s in affected_sites:
+                revoke_sa('sites', s['id'])
+            audit('revoke', 'certs', ident)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     return {'revoked': True, 'id': ident, 'serial': cert.get('serial'), 'crl_entries': len(revoked_rows)}
 
 
@@ -1207,23 +1235,26 @@ def diagnostics_check(body: dict):
             policy_allowed = False
             policy_reason = 'Denied by default-deny policy'
     elif src_site:
-        from vpn import _policy_connects_sites, _sites_are_peered
+        from vpn import _sites_are_peered
         src_site_nets = [ipaddress.IPv4Network(c) for c in site_effective_subnets(src_site, all_routes)]
+
+        def _match_site_policy(action):
+            for p in ordered_policies:
+                if p.get('action', 'allow') != action:
+                    continue
+                st = p.get('source_type', 'cidr')
+                src_match = (st == 'site' and p.get('source_ref') == src_site['id']) or (
+                    st == 'cidr' and p.get('source_cidr') and any(sn.overlaps(ipaddress.IPv4Network(p['source_cidr'])) for sn in src_site_nets)
+                )
+                if not src_match:
+                    continue
+                dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
+                if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
+                    return p
+            return None
+
         # Explicit DENY policies run BEFORE peer_sites / allow_vpc / allow policies (matching vpn.firewall).
-        blocked_by = None
-        for p in ordered_policies:
-            if p.get('action', 'allow') != 'deny':
-                continue
-            st = p.get('source_type', 'cidr')
-            src_match = (st == 'site' and p.get('source_ref') == src_site['id']) or (
-                st == 'cidr' and p.get('source_cidr') and any(sn.overlaps(ipaddress.IPv4Network(p['source_cidr'])) for sn in src_site_nets)
-            )
-            if not src_match:
-                continue
-            dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
-            if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
-                blocked_by = p
-                break
+        blocked_by = _match_site_policy('deny')
         if blocked_by:
             policy_allowed = False
             policy_reason = f"Blocked by deny policy '{blocked_by['name']}'"
@@ -1235,10 +1266,8 @@ def diagnostics_check(body: dict):
                 policy_allowed = True
                 policy_reason = f"Permitted by bidirectional site peering ({src_site['name']} <-> {matched_site['name']})"
             else:
-                allowed_p = next(
-                    (p for p in ordered_policies if _policy_connects_sites(p, src_site, matched_site, routes=all_routes) and _diag_proto_port_match(p, proto, port)),
-                    None,
-                )
+                # Directional ALLOW match (matching nftables chain forward: only source -> destination is permitted).
+                allowed_p = _match_site_policy('allow')
                 policy_allowed = bool(allowed_p)
                 policy_reason = f"Permitted by policy '{allowed_p['name']}'" if allowed_p else 'Denied by default-deny inter-site policy'
         else:
@@ -1247,20 +1276,7 @@ def diagnostics_check(body: dict):
                 policy_allowed = True
                 policy_reason = f"Permitted by site allow_vpc ({src_site['name']} <-> VPC)"
             else:
-                allowed_p = None
-                for p in ordered_policies:
-                    if p.get('action', 'allow') != 'allow':
-                        continue
-                    st = p.get('source_type', 'cidr')
-                    src_match = (st == 'site' and p.get('source_ref') == src_site['id']) or (
-                        st == 'cidr' and p.get('source_cidr') and any(sn.overlaps(ipaddress.IPv4Network(p['source_cidr'])) for sn in src_site_nets)
-                    )
-                    if not src_match:
-                        continue
-                    dst_nets = _diag_policy_dst_nets(p, matched_site, target_net, all_routes)
-                    if any(target_net.subnet_of(dn) for dn in dst_nets) and _diag_proto_port_match(p, proto, port):
-                        allowed_p = p
-                        break
+                allowed_p = _match_site_policy('allow')
                 policy_allowed = bool(allowed_p)
                 policy_reason = f"Permitted by policy '{allowed_p['name']}'" if allowed_p else 'Denied by default-deny policy'
 

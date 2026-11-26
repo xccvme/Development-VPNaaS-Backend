@@ -124,3 +124,85 @@ def test_custom_larger_pool_scaling_optional(monkeypatch):
     monkeypatch.setenv('VPNAAS_POOL_CIDR', '8.8.8.0/24')
     with pytest.raises(ValueError):
         pool.network()
+
+
+def test_cert_expiry_recomputed_and_revoke_rolls_back_on_error(tmp_path, monkeypatch):
+    """GET /api/pki/certs recomputes expired/days_remaining dynamically, and revoke rolls back DB on CRL failure."""
+    import json
+    import pki
+    from store import db, get, lock
+
+    monkeypatch.setenv('VPNAAS_SWANCTL_DIR', str(tmp_path / 'swanctl'))
+    monkeypatch.setenv('VPNAAS_CA_KEY', str(tmp_path / 'ca-key.pem'))
+    c = client()
+    cert = c.post('/api/pki/certs', json={'name': 'exp-check', 'target_type': 'user', 'validity_days': 10}).json()
+    cid = cert['id']
+    # Simulate an old stored row whose not_after is already in the past while persisted expired=False
+    with lock:
+        raw = get('certs', cid)
+        raw['not_after'] = '2020-01-01T00:00:00Z'
+        raw['days_remaining'] = 10
+        raw['expired'] = False
+        body = {k: v for k, v in raw.items() if k != 'id'}
+        db.execute('UPDATE objects SET body=? WHERE id=?', (json.dumps(body), cid))
+        db.commit()
+
+    detail = c.get(f'/api/pki/certs/{cid}').json()
+    assert detail['expired'] is True and detail['days_remaining'] < 0
+    listed = [x for x in c.get('/api/pki/certs').json() if x['id'] == cid][0]
+    assert listed['expired'] is True and listed['days_remaining'] < 0
+
+    # If rebuild_crl raises, DB must rollback so cert stays revoked=False
+    def boom(_rows):
+        raise RuntimeError('crl write failed')
+
+    monkeypatch.setattr(pki, 'rebuild_crl', boom)
+    with pytest.raises(RuntimeError):
+        c.post(f'/api/pki/certs/{cid}/revoke')
+    assert c.get(f'/api/pki/certs/{cid}').json()['revoked'] is False
+
+
+def test_diagnostics_directional_intersite_allow_and_route_site_overlap():
+    """Directional inter-site ALLOW policy only permits src->dst in diagnostics; site routes cannot overlap other sites."""
+    c = client()
+    sa = c.post('/api/sites', json={'name': 'dir-site-a', 'subnets': '192.168.140.0/24', 'allow_vpc': False}).json()
+    sb = c.post('/api/sites', json={'name': 'dir-site-b', 'subnets': '192.168.141.0/24', 'allow_vpc': False}).json()
+    pol = None
+    rt = None
+    try:
+        # Directional ALLOW: Site-A -> Site-B only (not peered)
+        pol = c.post('/api/policies', json={
+            'name': 'allow-a-to-b-443',
+            'action': 'allow',
+            'source_type': 'site', 'source_ref': sa['id'],
+            'destination_type': 'site', 'destination_ref': sb['id'],
+            'protocol': 'tcp', 'ports': '443',
+        }).json()
+        fwd = c.post('/api/diagnostics/check', json={
+            'source_site_id': sa['id'], 'target': '192.168.141.10', 'protocol': 'tcp', 'port': 443,
+        }).json()
+        rev = c.post('/api/diagnostics/check', json={
+            'source_site_id': sb['id'], 'target': '192.168.140.10', 'protocol': 'tcp', 'port': 443,
+        }).json()
+        assert fwd['policy']['allowed'] is True
+        assert rev['policy']['allowed'] is False
+
+        # Route attached to Site-A overlapping Site-B's subnet must be rejected (422)
+        bad_rt = c.post('/api/routes', json={
+            'name': 'overlap-site-b', 'destination_cidr': '192.168.141.0/25', 'site_id': sa['id'],
+        })
+        assert bad_rt.status_code == 422
+
+        # Valid non-overlapping route attached to Site-A blocks new Site-C overlapping that route
+        rt = c.post('/api/routes', json={
+            'name': 'extra-site-a', 'destination_cidr': '192.168.142.0/24', 'site_id': sa['id'],
+        }).json()
+        bad_site = c.post('/api/sites', json={'name': 'overlap-route-a', 'subnets': '192.168.142.0/24'})
+        assert bad_site.status_code == 422
+    finally:
+        if pol:
+            c.delete(f"/api/policies/{pol['id']}")
+        if rt:
+            c.delete(f"/api/routes/{rt['id']}")
+        c.delete(f"/api/sites/{sb['id']}")
+        c.delete(f"/api/sites/{sa['id']}")

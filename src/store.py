@@ -591,9 +591,10 @@ def validate_site(body,old):
     except Exception:pool=None
     if pool and any(n.overlaps(pool) for n in my_nets):
         raise HTTPException(422,'subnets tidak boleh overlap dengan pool VIP C2S')
+    all_routes=rows('routes')
     for other in rows('sites'):
         if other['id']==old.get('id'):continue
-        other_nets=[ipaddress.IPv4Network(x) for x in ts_split(other.get('subnets',''))]
+        other_nets=[ipaddress.IPv4Network(x) for x in site_effective_subnets(other,all_routes)]
         if any(a.overlaps(b) for a in my_nets for b in other_nets):
             raise HTTPException(422,f"subnets overlap dengan site '{other['name']}'")
     taken=_all_taken_ike_ids('sites',old.get('id'))
@@ -682,8 +683,16 @@ def validate_route(body,old):
     if site_id is None:
         data['site_id']=None
     else:
-        if type(site_id) is not int or not any(s['id']==site_id for s in rows('sites')):
+        all_sites=rows('sites')
+        if type(site_id) is not int or not any(s['id']==site_id for s in all_sites):
             raise HTTPException(422,'site_id tidak ditemukan')
+        other_routes=[r for r in rows('routes') if r['id']!=old.get('id')]
+        dst_net=ipaddress.IPv4Network(dst)
+        for other in all_sites:
+            if other['id']==site_id:continue
+            other_nets=[ipaddress.IPv4Network(x) for x in site_effective_subnets(other,other_routes)]
+            if any(dst_net.overlaps(n) for n in other_nets):
+                raise HTTPException(422,f"destination_cidr overlap dengan site '{other['name']}'")
         data['site_id']=site_id
 
     if not data['gateway'] and not data['interface'] and data['site_id'] is None:
