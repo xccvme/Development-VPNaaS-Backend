@@ -62,10 +62,18 @@ from pathlib import Path
 path=Path('/etc/vpnaas/backend.env')
 old=dict(line.split('=',1) for line in path.read_text().splitlines() if '=' in line) if path.exists() else {}
 route=json.loads(subprocess.check_output(['ip','-j','-4','route','get','1.1.1.1']))[0]
+main_routes=json.loads(subprocess.check_output(['ip','-j','-4','route','show','table','main']))
 addresses=json.loads(subprocess.check_output(['ip','-j','-4','addr']))
-private=[(a['ifname'],x) for a in addresses for x in a['addr_info'] if x.get('scope')=='global' and ipaddress.IPv4Address(x['local']).is_private and a['ifname']!=route['dev']]
+default_devs={r.get('dev') for r in main_routes if r.get('dst')=='default' and r.get('dev')}
+# Prefer an interface holding an actual global public IPv4 (handles multi-NIC OpenStack VMs
+# where a private NIC has a lower-metric default route than the public NIC).
+global_nics=[(a['ifname'],x) for a in addresses for x in a['addr_info'] if x.get('scope')=='global' and ipaddress.IPv4Address(x['local']).is_global and not ipaddress.IPv4Address(x['local']).is_private]
+pub_choice=next(((d,x) for d,x in global_nics if d in default_devs), global_nics[0] if global_nics else None)
+pub_if=pub_choice[0] if pub_choice else route['dev']
+pub_ip=pub_choice[1]['local'] if pub_choice else (route.get('prefsrc') or route.get('src'))
+private=[(a['ifname'],x) for a in addresses for x in a['addr_info'] if x.get('scope')=='global' and ipaddress.IPv4Address(x['local']).is_private and a['ifname']!=pub_if]
 lan=private[0] if private else None
-fallback={'PUBLIC_IP':route.get('prefsrc') or route.get('src'),'PUBLIC_IF':route['dev'],'LAN_CIDR':str(ipaddress.IPv4Network(f"{lan[1]['local']}/{lan[1]['prefixlen']}",strict=False)) if lan else '192.0.2.0/24','LAN_IF':lan[0] if lan else route['dev'],'LAN_IP':lan[1]['local'] if lan else route.get('prefsrc') or route.get('src'),'FULL_DNS':'1.1.1.1,8.8.8.8'}
+fallback={'PUBLIC_IP':pub_ip,'PUBLIC_IF':pub_if,'LAN_CIDR':str(ipaddress.IPv4Network(f"{lan[1]['local']}/{lan[1]['prefixlen']}",strict=False)) if lan else '192.0.2.0/24','LAN_IF':lan[0] if lan else pub_if,'LAN_IP':lan[1]['local'] if lan else pub_ip,'FULL_DNS':'1.1.1.1,8.8.8.8'}
 values={k:os.environ.get(k) or old.get('VPNAAS_'+k) or v for k,v in fallback.items()}
 for k in ('PUBLIC_IP','LAN_IP'): values[k]=str(ipaddress.IPv4Address(values[k]))
 if not ipaddress.IPv4Address(values['PUBLIC_IP']).is_global:raise SystemExit('PUBLIC_IP must be actual public IPv4; set PUBLIC_IP explicitly for NAT deployments')
@@ -127,6 +135,8 @@ export VPNAAS_API_KEY="$(</etc/vpnaas/api.key)"
 exec "$@"
 RUN
 chmod 700 /opt/vpnaas/backend/run
+# Pin public NIC source routing & default route priority BEFORE sysctl/offload tuning so SSH never drops on multi-NIC VMs.
+python3 -c "import sys; sys.path.insert(0,'/opt/vpnaas/backend'); import network; print('Public routing:', network.ensure_public_routing())" || true
 python3 /opt/vpnaas/backend/tuning.py --configure
 cat > /etc/systemd/system/vpnaas-api.service <<'UNIT'
 [Unit]
@@ -181,6 +191,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/vpnaas/backend
+EnvironmentFile=-/etc/vpnaas/backend.env
 ExecStart=/usr/bin/python3 /opt/vpnaas/backend/tuning.py
 OFFLOAD
 cat > /etc/systemd/system/vpnaas-offload.timer <<'OFFTIMER'

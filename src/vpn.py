@@ -738,6 +738,11 @@ def _apply_locked():
     try:
         from routing import apply_routes
         if route_auto:
+            from network import ensure_public_routing
+            try:
+                ensure_public_routing()
+            except Exception:
+                pass
             # Apply kernel proto-188 routes first so route_firewall() sees them immediately.
             apply_routes(routes)
         rules = firewall(connections, users, policies, sites=sites, groups=groups, routes=routes)

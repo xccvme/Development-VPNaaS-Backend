@@ -30,13 +30,190 @@ def configuration_lock():
             yield
 
 
+PUBLIC_ROUTE_TABLE = '188'
+PUBLIC_ROUTE_PREF = 250
+PUBLIC_ROUTE_PROTO = '188'
+
+
 def snapshot():
     return json.loads(subprocess.check_output(['ip', '-j', '-4', 'route', 'show', 'table', 'main'], timeout=5))
 
 
+def _interface_ipv4s(dev):
+    try:
+        out = json.loads(subprocess.check_output(['ip', '-j', '-4', 'addr', 'show', 'dev', dev], timeout=5))
+    except Exception:
+        return []
+    addrs = []
+    for item in out:
+        for info in item.get('addr_info', []):
+            if info.get('family') == 'inet' and info.get('local'):
+                addrs.append(info['local'])
+    return addrs
+
+
+def _ip_rules():
+    try:
+        return json.loads(subprocess.check_output(['ip', '-j', '-4', 'rule', 'show'], timeout=5))
+    except Exception:
+        return []
+
+
+def _is_global_ipv4(val):
+    if not val:
+        return False
+    try:
+        addr = ipaddress.IPv4Address(val)
+        return addr.is_global and not addr.is_private
+    except ValueError:
+        return False
+
+
 def public_interface(routes):
     defaults = [r for r in routes if r.get('dst') == 'default' and r.get('dev')]
-    return min(defaults, key=lambda r: r.get('metric', 0))['dev'] if defaults else None
+    if not defaults:
+        return None
+    configured = os.environ.get('VPNAAS_PUBLIC_IF', '').strip()
+    if configured:
+        matched = [r for r in defaults if r.get('dev') == configured]
+        if matched:
+            return configured
+    # Multi-NIC OpenStack/cloud guard: prefer a default route carrying a globally
+    # routable IPv4 (prefsrc or gateway) over a lower-metric private NIC default.
+    global_defaults = [
+        r for r in defaults
+        if _is_global_ipv4(r.get('prefsrc')) or _is_global_ipv4(r.get('gateway'))
+    ]
+    pool = global_defaults or defaults
+    return min(pool, key=lambda r: r.get('metric', 0))['dev']
+
+
+def ensure_public_routing(routes=None):
+    """Protect inbound SSH/IKEv2 and outbound internet on multi-NIC VMs (e.g. OpenStack).
+
+    1. Pins replies sourced from the public NIC's IPv4 to table 188 (ip rule pref 250,
+       after strongSwan table 220 and before main) so a lower-metric default route on a
+       private NIC can never hijack SSH or IPsec handshakes into asymmetric drop.
+    2. When another NIC advertises a competing lower/equal-metric default route in table
+       main, installs an owned `proto 188` higher-priority default route on the public NIC
+       without deleting DHCP/cloud-init routes.
+    """
+    if os.environ.get('VPNAAS_DRY_RUN') == '1':
+        return {'changed': False, 'dry_run': True}
+    routes = snapshot() if routes is None else routes
+    pub_if = public_interface(routes)
+    if not pub_if:
+        return {'changed': False, 'reason': 'no_public_interface'}
+
+    # Find the native (non-proto-188) default route on pub_if to get its true gateway/metric.
+    pub_native = [
+        r for r in routes
+        if r.get('dst') == 'default' and r.get('dev') == pub_if and r.get('gateway') and str(r.get('protocol', '')) != PUBLIC_ROUTE_PROTO
+    ]
+    if not pub_native:
+        return {'changed': False, 'public_if': pub_if, 'reason': 'no_public_gateway'}
+    best_pub = min(pub_native, key=lambda r: int(r.get('metric', 0)))
+    pub_gw = best_pub['gateway']
+    pub_metric = int(best_pub.get('metric', 0))
+
+    iface_ips = _interface_ipv4s(pub_if)
+    env_pub_ip = os.environ.get('VPNAAS_PUBLIC_IP', '').strip()
+    pub_src = None
+    if best_pub.get('prefsrc') and (not iface_ips or best_pub['prefsrc'] in iface_ips):
+        pub_src = best_pub['prefsrc']
+    elif env_pub_ip and env_pub_ip in iface_ips:
+        pub_src = env_pub_ip
+    elif iface_ips:
+        pub_src = next((ip for ip in iface_ips if _is_global_ipv4(ip)), iface_ips[0])
+
+    changed = False
+
+    # 1. Source policy routing table 188 for pub_src -> ALWAYS reply via pub_if/pub_gw!
+    if pub_src:
+        for r in routes:
+            if r.get('dev') == pub_if and r.get('scope') == 'link' and r.get('dst') and r.get('dst') != 'default':
+                subprocess.run(
+                    ['ip', '-4', 'route', 'replace', r['dst'], 'dev', pub_if, 'scope', 'link', 'src', pub_src, 'table', PUBLIC_ROUTE_TABLE, 'proto', PUBLIC_ROUTE_PROTO],
+                    check=False, capture_output=True, text=True, timeout=8,
+                )
+        subprocess.run(
+            ['ip', '-4', 'route', 'replace', 'default', 'via', pub_gw, 'dev', pub_if, 'src', pub_src, 'table', PUBLIC_ROUTE_TABLE, 'proto', PUBLIC_ROUTE_PROTO],
+            check=True, capture_output=True, text=True, timeout=8,
+        )
+        rules = _ip_rules()
+        has_rule = False
+        for rule in rules:
+            if str(rule.get('table')) == PUBLIC_ROUTE_TABLE and int(rule.get('priority', -1)) == PUBLIC_ROUTE_PREF:
+                if rule.get('src') == pub_src and str(rule.get('srclen', 32)) == '32':
+                    has_rule = True
+                else:
+                    subprocess.run(
+                        ['ip', '-4', 'rule', 'del', 'pref', str(PUBLIC_ROUTE_PREF), 'table', PUBLIC_ROUTE_TABLE],
+                        check=False, capture_output=True, text=True, timeout=8,
+                    )
+                    changed = True
+        if not has_rule:
+            subprocess.run(
+                ['ip', '-4', 'rule', 'add', 'from', f'{pub_src}/32', 'lookup', PUBLIC_ROUTE_TABLE, 'pref', str(PUBLIC_ROUTE_PREF)],
+                check=True, capture_output=True, text=True, timeout=8,
+            )
+            changed = True
+
+    # 2. Competing private-NIC default route guard in table main (owned proto 188 only).
+    other_defaults = [
+        r for r in routes
+        if r.get('dst') == 'default' and r.get('dev') != pub_if and str(r.get('protocol', '')) != PUBLIC_ROUTE_PROTO
+    ]
+    existing_owned_defaults = [
+        r for r in routes
+        if r.get('dst') == 'default' and str(r.get('protocol', '')) == PUBLIC_ROUTE_PROTO
+    ]
+    need_override = False
+    desired_metric = None
+    if other_defaults:
+        min_other = min(int(r.get('metric', 0)) for r in other_defaults)
+        if min_other <= pub_metric and min_other > 1:
+            need_override = True
+            desired_metric = max(1, min_other - 10)
+
+    if need_override:
+        already_ok = any(
+            r.get('dev') == pub_if and r.get('gateway') == pub_gw and int(r.get('metric', 0)) == desired_metric
+            for r in existing_owned_defaults
+        )
+        if not already_ok:
+            args = ['ip', '-4', 'route', 'replace', 'default', 'via', pub_gw, 'dev', pub_if]
+            if pub_src:
+                args += ['src', pub_src]
+            args += ['metric', str(desired_metric), 'proto', PUBLIC_ROUTE_PROTO]
+            subprocess.run(args, check=True, capture_output=True, text=True, timeout=8)
+            changed = True
+        for r in existing_owned_defaults:
+            m = int(r.get('metric', 0))
+            if r.get('dev') != pub_if or r.get('gateway') != pub_gw or m != desired_metric:
+                del_args = ['ip', '-4', 'route', 'del', 'default']
+                if m > 0:
+                    del_args += ['metric', str(m)]
+                del_args += ['proto', PUBLIC_ROUTE_PROTO]
+                subprocess.run(del_args, check=False, capture_output=True, text=True, timeout=8)
+                changed = True
+    else:
+        for r in existing_owned_defaults:
+            m = int(r.get('metric', 0))
+            del_args = ['ip', '-4', 'route', 'del', 'default']
+            if m > 0:
+                del_args += ['metric', str(m)]
+            del_args += ['proto', PUBLIC_ROUTE_PROTO]
+            subprocess.run(del_args, check=False, capture_output=True, text=True, timeout=8)
+            changed = True
+
+    return {
+        'changed': changed,
+        'public_if': pub_if,
+        'public_src': pub_src,
+        'public_gw': pub_gw,
+        'override_metric': desired_metric,
+    }
 
 
 def private_route(cidr, routes, public):
@@ -192,6 +369,10 @@ def reconcile():
     from store import rows
     from pathlib import Path
     with configuration_lock():
+        try:
+            ensure_public_routing()
+        except Exception:
+            pass
         rules = firewall(rows('connections'), rows('users'), rows('policies'),
                          sites=rows('sites'), groups=rows('groups'), routes=rows('routes'))
         path = Path('/opt/vpnaas/firewall.nft')
