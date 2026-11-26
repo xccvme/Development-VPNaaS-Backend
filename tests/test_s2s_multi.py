@@ -71,14 +71,15 @@ def test_firewall_every_pair_both_directions():
     for l in ('10.1.0.0/24','10.3.0.0/24'):
         for r in ('10.2.0.0/24','10.4.0.0/24'):
             assert f'ip saddr {r} ip daddr {l} meta ipsec exists accept' in fwd
-            assert f'ip saddr {l} ip daddr {r} accept' in fwd
+            assert f'ip saddr {l} ip daddr {r} rt ipsec exists accept' in fwd
             assert f'ip saddr {r} ip daddr {l} meta ipsec exists tcp flags' in mss
             assert f'ip saddr {l} ip daddr {r} rt ipsec exists tcp flags' in mss
     assert fwd.count('meta ipsec exists accept')==4
+    assert fwd.count('rt ipsec exists accept')==4
     assert '10.1.0.0/24,' not in rules  # never a raw comma list inside a rule
 
 def test_firewall_single_cidr_byte_identical():
     from vpn import firewall
     c=dict(CONN,local_ts='10.1.0.0/24',remote_ts='10.2.0.0/24')
     rules=firewall([c],[],[])
-    assert 'ip saddr 10.2.0.0/24 ip daddr 10.1.0.0/24 meta ipsec exists accept\nip saddr 10.1.0.0/24 ip daddr 10.2.0.0/24 accept\n' in rules
+    assert 'ip saddr 10.2.0.0/24 ip daddr 10.1.0.0/24 meta ipsec exists accept\nip saddr 10.1.0.0/24 ip daddr 10.2.0.0/24 rt ipsec exists accept\n' in rules

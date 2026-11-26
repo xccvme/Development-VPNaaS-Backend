@@ -7,6 +7,9 @@ LAN_CIDR="${LAN_CIDR:-}"
 LAN_IF="${LAN_IF:-}"
 LAN_IP="${LAN_IP:-}"
 FULL_DNS="${FULL_DNS:-}"
+REGION="${REGION:-}"
+TENANT_ID="${TENANT_ID:-}"
+INSTANCE_ID="${INSTANCE_ID:-}"
 # Numeric sysctl overrides; defaults fit a small VM, not throughput guarantees.
 export TUNE_NET_CORE_RMEM_MAX="${TUNE_NET_CORE_RMEM_MAX:-16777216}"
 export TUNE_NET_CORE_WMEM_MAX="${TUNE_NET_CORE_WMEM_MAX:-16777216}"
@@ -18,7 +21,7 @@ export TUNE_NET_IPV4_TCP_RMEM="${TUNE_NET_IPV4_TCP_RMEM:-4096 87380 16777216}"
 export TUNE_NET_IPV4_TCP_WMEM="${TUNE_NET_IPV4_TCP_WMEM:-4096 65536 16777216}"
 export TUNE_NET_NETFILTER_NF_CONNTRACK_MAX="${TUNE_NET_NETFILTER_NF_CONNTRACK_MAX:-262144}"
 export TUNE_FS_FILE_MAX="${TUNE_FS_FILE_MAX:-2097152}"
-export PUBLIC_IP PUBLIC_IF LAN_CIDR LAN_IF LAN_IP FULL_DNS
+export PUBLIC_IP PUBLIC_IF LAN_CIDR LAN_IF LAN_IP FULL_DNS REGION TENANT_ID INSTANCE_ID
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 . /etc/os-release
 [[ $ID == debian && $VERSION_ID == 13 ]] || { echo 'Debian 13 required' >&2; exit 1; }
@@ -26,7 +29,7 @@ export DEBIAN_FRONTEND=noninteractive
 umask 077
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl openssl python3 python3-venv nftables iproute2 ethtool kmod charon-systemd strongswan-swanctl strongswan-pki libcharon-extra-plugins libcharon-extauth-plugins libstrongswan-extra-plugins libstrongswan-standard-plugins
-install -d -m 700 /opt/vpnaas/backend /var/lib/vpnaas /etc/vpnaas /etc/swanctl/conf.d /etc/swanctl/private /etc/swanctl/x509 /etc/swanctl/x509ca
+install -d -m 700 /opt/vpnaas/backend /var/lib/vpnaas /etc/vpnaas /etc/swanctl/conf.d /etc/swanctl/private /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/x509crl
 # Back up state before configuration or schema changes; never expose credentials.
 python3 - <<'BACKUP'
 from pathlib import Path
@@ -72,7 +75,15 @@ for k in ('PUBLIC_IF','LAN_IF'):
     if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}',values[k]) or not Path('/sys/class/net',values[k]).exists():raise SystemExit('Invalid interface '+k)
 values['FULL_DNS']=','.join(str(ipaddress.IPv4Address(x.strip())) for x in values['FULL_DNS'].split(','))
 if not 1<=len(values['FULL_DNS'].split(','))<=4:raise SystemExit('Set 1-4 DNS servers')
-path.write_text(''.join('VPNAAS_'+k+'='+v+'\n' for k,v in values.items())+'VPNAAS_DB=/var/lib/vpnaas/data.sqlite3\nVPNAAS_ROUTE_AUTO=1\n'+('VPNAAS_POOL_CIDR='+old['VPNAAS_POOL_CIDR']+'\n' if old.get('VPNAAS_POOL_CIDR') else ''))
+extra_meta=''
+for mk in ('REGION','TENANT_ID','INSTANCE_ID'):
+    mv=os.environ.get(mk) or old.get('VPNAAS_'+mk) or ''
+    if mv and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',mv):
+        extra_meta+='VPNAAS_'+mk+'='+mv+'\n'
+for opt_k in ('VPNAAS_POOL_ALLOW_CUSTOM','VPNAAS_PUBLIC_DOCS','VPNAAS_SESSION_LIMIT'):
+    if old.get(opt_k) in ('0','1'):
+        extra_meta+=opt_k+'='+old[opt_k]+'\n'
+path.write_text(''.join('VPNAAS_'+k+'='+v+'\n' for k,v in values.items())+'VPNAAS_DB=/var/lib/vpnaas/data.sqlite3\nVPNAAS_ROUTE_AUTO=1\nVPNAAS_USE_VICI=1\n'+extra_meta+('VPNAAS_POOL_CIDR='+old['VPNAAS_POOL_CIDR']+'\n' if old.get('VPNAAS_POOL_CIDR') else ''))
 path.chmod(0o600)
 key=Path('/etc/vpnaas/api.key')
 if not key.exists():

@@ -70,9 +70,9 @@ def enforce_once():
     if os.environ.get('VPNAAS_DRY_RUN') == '1':
         return []
     import vpn
-    from runtime import parse_sas
+    from vici_client import list_sas
     from store import lock, rows, audit, db
-    sas = parse_sas(vpn.run(['swanctl', '--list-sas', '--raw'], timeout=8))
+    sas = list_sas()
     with lock:
         users = [u for u in rows('users') if u.get('enabled', True)]
     actions = []

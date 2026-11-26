@@ -46,7 +46,7 @@ def test_create_defaults_and_redaction():
         assert a['psk_set'] is True and b['psk_set'] is True
         assert 'psk' not in a and 'psk' not in b and 'hub-site-a-secret-123' not in str(row)
         for s in (a, b):
-            assert s['status'] == 'down' and s['remote_host'] is None
+            assert s['status'] == 'unknown' and s['remote_host'] is None
             assert s['bytes_in'] == 0 and s['bytes_out'] == 0
         from store import get
         stored = get('connections', row['id'])
@@ -187,8 +187,8 @@ def test_firewall_hub_pairs():
     fwd = rules.split('chain forward')[1].split('chain nat')[0]
     mss = rules.split('chain mss')[1].split('chain forward')[0]
     for b in ('172.16.1.0/24', '10.221.61.0/24'):
-        assert f'ip saddr 10.10.7.0/24 ip daddr {b} meta ipsec exists accept' in fwd
-        assert f'ip saddr {b} ip daddr 10.10.7.0/24 meta ipsec exists accept' in fwd
+        assert f'ip saddr 10.10.7.0/24 ip daddr {b} meta ipsec exists rt ipsec exists accept' in fwd
+        assert f'ip saddr {b} ip daddr 10.10.7.0/24 meta ipsec exists rt ipsec exists accept' in fwd
         assert f'ip saddr 10.10.7.0/24 ip daddr {b} meta ipsec exists tcp flags & (syn|rst) == syn tcp option maxseg size > 1300 tcp option maxseg size set 1300' in mss
         assert f'ip saddr {b} ip daddr 10.10.7.0/24 meta ipsec exists tcp flags' in mss
     assert '10.221.61.0/24,' not in rules
@@ -257,8 +257,14 @@ def test_spoke_script(tmp_path):
         assert 'swanctl --load-all' in s and '--initiate' in s
         assert 'NAT=1' in s
         p = tmp_path / 's.sh'
-        p.write_text(s)
-        assert subprocess.run(['bash', '-n', str(p)]).returncode == 0
+        p.write_text(s, encoding='utf-8', newline='\n')
+        import os, shutil
+        bash = shutil.which('bash') if os.name == 'posix' else next(
+            (b for b in (r'C:\Program Files\Git\bin\bash.exe', r'C:\Program Files\Git\usr\bin\bash.exe') if os.path.exists(b)),
+            None,
+        )
+        if bash:
+            assert subprocess.run([bash, '-n', str(p)]).returncode == 0
         c.put(f"/api/connections/{row['id']}", json={'site_b': {'nat': False}})
         s2 = c.get(f"/api/connections/{row['id']}/sites/b/config?format=script").text
         assert 'NAT=0' in s2
@@ -322,7 +328,7 @@ def test_runtime_status(monkeypatch):
         assert got['site_b']['status'] == 'down' and got['site_b']['remote_host'] == '192.0.2.9:61000'
         monkeypatch.setattr(vpn, 'run', lambda args, **k: 'garbage')
         got = c.get(f'/api/connections/{i}').json()
-        assert got['site_a']['status'] == 'down'
+        assert got['site_a']['status'] == 'unknown'
     finally:
         monkeypatch.setenv('VPNAAS_DRY_RUN', '1')
         c.delete(f'/api/connections/{i}')

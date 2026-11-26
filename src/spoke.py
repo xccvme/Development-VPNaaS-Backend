@@ -11,8 +11,8 @@ MSS = 1300
 
 
 def hub_address():
-    from vpn import PUBLIC_IP
-    return PUBLIC_IP
+    from vpn import public_ip
+    return public_ip()
 
 
 def names(c, side):

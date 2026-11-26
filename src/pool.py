@@ -5,12 +5,23 @@ import os
 from pathlib import Path
 import secrets
 import subprocess
-import fcntl
+import threading
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX dev hosts
+    fcntl = None
+
+_LOCAL_LOCK = threading.Lock()
 
 
 def network():
-    net=ipaddress.IPv4Network(os.environ.get('VPNAAS_POOL_CIDR','172.31.201.0/24'))
-    if net.prefixlen!=24 or not net.subnet_of(ipaddress.ip_network('172.31.0.0/16')) or not 201<=int(str(net.network_address).split('.')[2])<=250:
+    raw = os.environ.get('VPNAAS_POOL_CIDR', '172.31.201.0/24')
+    net = ipaddress.IPv4Network(raw)
+    if os.environ.get('VPNAAS_POOL_ALLOW_CUSTOM') == '1':
+        if not net.is_private or not 20 <= net.prefixlen <= 24:
+            raise ValueError('Custom VPNAAS_POOL_CIDR must be private IPv4 /20../24')
+        return net
+    if net.prefixlen != 24 or not net.subnet_of(ipaddress.ip_network('172.31.0.0/16')) or not 201 <= int(str(net.network_address).split('.')[2]) <= 250:
         raise ValueError('VPNAAS_POOL_CIDR must be 172.31.201..250.0/24')
     return net
 
@@ -25,9 +36,13 @@ def choose(occupied):
 def ensure(path,occupied):
     path=Path(path)
     lock=path.with_suffix('.pool.lock')
-    with lock.open('a') as handle:
-        os.chmod(lock,0o600)
-        fcntl.flock(handle,fcntl.LOCK_EX)
+    with _LOCAL_LOCK, lock.open('a') as handle:
+        try:
+            os.chmod(lock,0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(handle,fcntl.LOCK_EX)
         text=path.read_text() if path.exists() else ''
         for line in text.splitlines():
             if line.startswith('VPNAAS_POOL_CIDR='):
@@ -56,11 +71,13 @@ def leased(users):
 
 def allocate_many(users,count):
     from fastapi import HTTPException
+    net = network()
+    usable = max(0, net.num_addresses - 2)
     used=leased(users);result=[]
-    for host in network().hosts():
+    for host in net.hosts():
         if len(result)==count:break
         if str(host) not in used:result.append(str(host))
-    if len(result)<count:raise HTTPException(409,'VIP pool exhausted (254 usable hosts; each session slot needs one)')
+    if len(result)<count:raise HTTPException(409,f'VIP pool exhausted ({usable} usable hosts; each session slot needs one)')
     return result
 
 
@@ -136,7 +153,12 @@ if __name__=='__main__':
         for kind,body in conn.execute('SELECT kind,body FROM objects'):
             u=json.loads(body)
             occupied.extend(u.get('allowed_cidrs',[]))
-            occupied.extend(x.strip() for k in ('local_ts','remote_ts','source_cidr','destination_cidr') if k in u for x in str(u[k]).split(',') if x.strip())
+            occupied.extend(x.strip() for k in ('local_ts','remote_ts','source_cidr','destination_cidr','subnets') if k in u for x in str(u[k]).split(',') if x.strip())
+            for side in ('site_a','site_b'):
+                if isinstance(u.get(side),dict) and u[side].get('subnets'):
+                    occupied.extend(x.strip() for x in str(u[side]['subnets']).split(',') if x.strip())
             if u.get('virtual_ip'):occupied.append(u['virtual_ip']+'/32')
+            for ev in u.get('extra_virtual_ips',[]):
+                if ev:occupied.append(ev+'/32')
         conn.close()
     print('Server VIP pool: '+ensure(path,occupied))

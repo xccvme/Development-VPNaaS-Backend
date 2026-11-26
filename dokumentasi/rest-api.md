@@ -431,3 +431,57 @@ Validasi sengaja tidak mengembalikan input atau secret. Respons CRUD biasa mengh
 CRUD melakukan validasi, perubahan SQLite, apply swanctl/nft, audit, lalu commit. Pada kegagalan terjadi rollback transaksi; apply berupaya memulihkan konfigurasi lama. Penghentian sesi yang sudah terjadi tidak dapat dibatalkan oleh rollback, dan timeout/perintah OS yang gagal tak terduga dapat menghasilkan 500. Pesan 502 bukan jaminan semua efek runtime sudah pulih: periksa status/journal sebelum mencoba ulang. Tidak ada idempotency key; setelah koneksi HTTP putus, baca list sebelum mengulang create agar tidak membuat asumsi salah. Operasi PUT/DELETE akun dan koneksi selalu mencoba revoke SA terkait. Policy tidak mempunyai revoke SA khusus.
 
 Bila API belum siap, mulai dari `journalctl -u vpnaas-api`, listener loopback, strongSwan, lalu `/api/status`. Bila `private_ready=false`, perbaiki route/NIC privat dari platform, bukan membuka grant `0.0.0.0/0`. Timer reconciler menyesuaikan firewall untuk perubahan route tanpa memuat ulang swanctl atau memutus SA. Jangan mengubah langsung DB/pool/key saat service berjalan untuk menutupi masalah. Panduan lanjutan: [instalasi dan operasi](instalasi.md), [jaringan privat](jaringan.md), [pool VIP dan migrasi](pool-vip.md), [Windows](windows.md).
+
+
+---
+
+## 8. Ekstensi v2.0 (Arsitektur Produk VPNaaS & Hardening)
+
+Bagian ini mendokumentasikan perbaikan bug serta ekspansi fitur v2.0 agar selaras dengan rancangan **Hub-and-Spoke Multi-Site IPsec/IKEv2, PKI/X.509, Static Routing, Granular ACL Default-Deny, Multi-Vendor Config, Multi-Platform Client Profiles, Token-Based Auth (CP), dan Readiness/Diagnostics**. Seluruh endpoint v1 di atas tetap dipertahankan 100% backward-compatible.
+
+### Autentikasi Token-Based & RBAC (`/api/tokens`)
+
+Semua endpoint bisnis menerima **`X-API-Key: <token>`** maupun **`Authorization: Bearer <token>`**.
+Bootstrap key `/etc/vpnaas/api.key` memiliki role **`admin`**. Token tambahan (untuk integrasi Customer Portal) disimpan sebagai hash SHA-256 di SQLite dengan tiga role:
+- `readonly`: hanya `GET` non-rahasia (tidak dapat mengunduh `/profile`, `/config`, `/bundle`, atau mutasi).
+- `operator`: seluruh operasi VPN (CRUD, connect/disconnect, unduh profil/config/bundle, issue/revoke sertifikat, diagnostics); tidak dapat mengelola `/api/tokens` atau rotasi sertifikat server.
+- `admin`: akses penuh termasuk manajemen `/api/tokens` dan `POST /api/pki/server/rotate`.
+
+Route dokumentasi `/docs`, `/redoc`, dan `/openapi.json` dinonaktifkan secara publik secara default (aktifkan hanya untuk dev dengan `VPNAAS_PUBLIC_DOCS=1`). Gunakan **`GET /api/openapi.json`** terautentikasi.
+
+### Daftar Endpoint Baru v2.0
+
+| Metode | Path | Role Min | Fungsi |
+|---|---|---|---|
+| GET | `/api/ready` | readonly | Deep readiness probe provisioning CP (SQLite, strongSwan/VICI, nftables, PKI) — `200` READY / `503` DEGRADED |
+| GET | `/api/gateway` | readonly | Metadata gateway (`region`, `tenant_id`, `instance_id`, `public_ip`, `pool_cidr`, `capabilities`, `pki`) |
+| GET | `/api/openapi.json` | readonly | Spesifikasi OpenAPI terautentikasi |
+| GET / POST / DELETE | `/api/tokens`, `/api/tokens/{id}` | admin | Manajemen token API berbasis hash SHA-256 (plaintext dikembalikan sekali saat create, `no-store`) |
+| GET / POST / PUT / DELETE | `/api/sites`, `/api/sites/{id}` | readonly / operator | **Multi-Site S2S (Site-A/B/.../N)** dengan default-deny inter-site, auth `psk` atau `pubkey`, custom strong IKE/ESP presets, runtime (`active`/`down`/`unknown`) |
+| GET | `/api/sites/{id}/config?vendor=...` | operator | Generator config S2S multi-vendor: `swanctl`, `script`, `mikrotik`, `fortigate`, `cisco` (`no-store`) |
+| POST | `/api/sites/{id}/connect`, `/disconnect` | operator | Inisiasi/terminasi tunnel Multi-Site (`409` bila disabled atau `%any`) |
+| GET / POST / PUT / DELETE | `/api/groups`, `/api/groups/{id}` | readonly / operator | Grup user C2S (`allowed_cidrs`, `allowed_sites`, `traffic_mode`, `max_sessions`) |
+| POST | `/api/users/{id}/disconnect` | operator | Putuskan seluruh sesi aktif milik akun C2S |
+| POST | `/api/users/{id}/sessions/{ike_id}/disconnect` | operator | Putuskan 1 sesi IKE spesifik berdasarkan numeric `ike_id` |
+| GET | `/api/users/{id}/profile?format=...` | operator | Profil multi-platform: `json` (default), `mobileconfig` (macOS/iOS), `sswan` (Android strongSwan), `windows` (`.ps1`) |
+| GET / POST / PUT / DELETE | `/api/routes`, `/api/routes/{id}` | readonly / operator | Static routing Linux terisolasi (`proto 188`) |
+| GET | `/api/routes/live` | readonly | Status sinkronisasi static route + tabel route kernel `main` |
+| GET | `/api/policies/{id}` | readonly | Detail 1 firewall policy (kini mendukung `action: allow\|deny`, `ports`, `priority`, `source_type/ref` `cidr\|site\|user\|group`, `destination_type/ref` `cidr\|site\|vpc`) |
+| GET | `/api/pki/ca`, `/api/pki/ca/cert` | readonly | Info & unduh Root CA PEM |
+| GET / POST | `/api/pki/server`, `/api/pki/server/rotate` | readonly / admin | Info masa berlaku sertifikat server & rotasi tanpa mengganti CA |
+| GET / POST | `/api/pki/certs`, `/api/pki/certs/{id}` | readonly / operator | Terbitkan & lihat sertifikat X.509 untuk user (`clientAuth`) atau site (`clientAuth`+`serverAuth`) |
+| GET | `/api/pki/certs/{id}/bundle?format=pem\|p12` | operator | Unduh bundle PEM atau PKCS#12 `.p12` (`no-store`) |
+| POST | `/api/pki/certs/{id}/revoke` | operator | Cabut sertifikat, bangun & pasang ulang CRL (`/etc/swanctl/x509crl/ca.crl`), dan putus SA aktif terkait |
+| GET | `/api/pki/crl` | readonly | Unduh CRL PEM terbaru |
+| GET | `/api/monitoring/tunnels` | readonly | Ringkasan telemetry terpadu (C2S + Multi-Site + Hub + Direct, total bytes in/out) |
+| GET | `/api/logs?source=...&lines=...` | readonly | Pembaca log `journalctl` dengan redaksi otomatis secret/token/PSK/password |
+| POST | `/api/diagnostics/check` | operator | Verifikasi jalur (route + tunnel SA + evaluasi ACL + opsional ping terbatas) |
+
+### Catatan Perbaikan Bug & Hardening v2.0
+
+1. **Anti-Leak Plaintext S2S (`rt ipsec exists`)**: Rule forward Hub transit kini menegakkan `meta ipsec exists rt ipsec exists accept` dan Direct outbound menegakkan `rt ipsec exists accept` sehingga trafik tidak pernah bocor keluar interface publik ketika tunnel peer sedang down.
+2. **Dukungan C2S → S2S pada `VPNAAS_ROUTE_AUTO=1`**: Grant C2S yang mengarah ke subnet site S2S aktif (via `allowed_cidrs`, `allowed_sites`, atau `groups`) kini diterjemahkan menjadi `rt ipsec exists accept` dan `local_ts` hub menyertakan pool VIP C2S untuk jalur balik.
+3. **Urutan `apply` sebelum `revoke`**: Pada mutasi `PUT`/`DELETE`, konfigurasi baru diterapkan dulu sebelum revokasi SA, sehingga kegagalan apply tidak memutus sesi aktif secara sia-sia dan sesi yang dicabut tidak sempat reconnect dengan kredensial lama.
+4. **Telemetry Akurat**: `hub_runtime()` dan `direct_runtime()` kini melaporkan `unknown` (bukan `down`) saat daemon error/dry-run, selaras dengan `user_runtime()` dan UI.
+5. **Thread-Safety**: `GET /api/status` kini membaca SQLite di dalam `store.lock`.
+6. **Skalabilitas Opsional**: `VPNAAS_POOL_ALLOW_CUSTOM=1` memungkinkan pool privat `/20`..`/24` (hingga 4.094 lease) di luar default `/24` (`172.31.201..250.0/24`), dan `VPNAAS_USE_VICI=1` mengaktifkan pembacaan VICI socket native dengan fallback otomatis ke `swanctl`.
